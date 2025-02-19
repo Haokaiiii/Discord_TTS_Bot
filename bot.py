@@ -43,32 +43,27 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ---------------- 字体与样式设置 ----------------
-matplotlib.use('Agg')  # Use Agg backend
+matplotlib.use('Agg')  # Use Agg backend for better compatibility
+sns.set(style="whitegrid")
 
-# Debug font paths and cache
-logging.info("Font debugging information:")
-logging.info(f"Font cache path: {matplotlib.get_cachedir()}")
-logging.info(f"Matplotlib config path: {matplotlib.get_configdir()}")
+# Configure matplotlib for CJK support using system fonts
+plt.rcParams['axes.unicode_minus'] = False  # Ensure minus signs display correctly
 
-# List all font files in the system
-font_files = subprocess.run(['fc-list'], capture_output=True, text=True)
-logging.info("Available font files:")
-logging.info(font_files.stdout)
+logging.info("Using system fonts with default configuration")
 
-# Configure fonts
-plt.rcParams['font.family'] = 'Noto Sans CJK SC'
-plt.rcParams['font.sans-serif'] = ['Noto Sans CJK SC']
-plt.rcParams['axes.unicode_minus'] = False
-
-# Set Seaborn style
-sns.set_theme(style="whitegrid")
-
-# Verify font configuration
-font_list = [f.name for f in matplotlib.font_manager.fontManager.ttflist]
-logging.info(f"Available matplotlib fonts: {font_list}")
-
-# Force font manager to rebuild the font cache
-matplotlib.font_manager._rebuild()
+# Use WenQuanYi Zen Hei if available; otherwise fallback
+font_path = '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc'
+if os.path.exists(font_path):
+    font_prop = fm.FontProperties(fname=font_path)
+    # Configure rcParams so that Matplotlib and Seaborn use WenQuanYi Zen Hei
+    plt.rcParams['font.sans-serif'] = [font_prop.get_name()]
+    plt.rcParams['font.family'] = 'sans-serif'
+    plt.rcParams['axes.unicode_minus'] = False
+    sns.set(style="whitegrid", font=font_prop.get_name())
+    logging.info(f"Using WQY Zen Hei font: {font_prop.get_name()}")
+else:
+    logging.warning(f"字体文件 {font_path} 不存在，使用默认字体。")
+    sns.set(style="whitegrid")
 
 # ---------------- 初始化 Bot ----------------
 intents = discord.Intents.default()
@@ -855,7 +850,7 @@ async def generate_co_occurrence_heatmap(guild_id):
             final_users.add(u2)
         final_users = list(final_users)
 
-        # **重点**: 按"总时长"从大到小排序
+        # 按"总时长"从大到小排序
         final_users = sorted(
             final_users,
             key=lambda uid: guild_voice_stat[uid]['total'] if uid in guild_voice_stat else 0,
@@ -1009,7 +1004,7 @@ async def generate_co_occurrence_heatmap_relative(guild_id):
             final_users.add(u2)
         final_users = list(final_users)
 
-        # **按照"总时长"从大到小**排序
+        # 按"总时长"从大到小排序
         final_users = sorted(
             final_users,
             key=lambda uid: guild_voice_stat[uid]['total'] if uid in guild_voice_stat else 0,
@@ -1042,6 +1037,7 @@ async def generate_co_occurrence_heatmap_relative(guild_id):
 
         # 6) 坐标标签
         labels = []
+        guild_obj = bot.get_guild(guild_id)
         for uid in final_users:
             m = guild_obj.get_member(uid)
             labels.append(get_preferred_name(m) if m else str(uid))

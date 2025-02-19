@@ -20,13 +20,23 @@ RUN useradd -m -u 1000 botuser
 
 WORKDIR /app
 
-# Install runtime dependencies and fonts
+# Install runtime dependencies and fonts with better CJK support
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     libnss3 \
     libasound2 \
     fontconfig \
     fonts-noto-cjk \
+    fonts-noto-cjk-extra \
+    fonts-noto-color-emoji \
+    fonts-wqy-microhei \
+    fonts-wqy-zenhei \
+    fonts-arphic-ukai \
+    fonts-arphic-uming \
+    libnss3 \
+    libasound2 \
+    wget \
+    && fc-cache -fv \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy wheels from builder
@@ -43,6 +53,9 @@ COPY . .
 RUN mkdir -p /app/tts_cache /app/data_backup /app/mplconfig \
     && chown -R botuser:botuser /app \
     && chmod -R 755 /app
+
+# Create fonts directory with permissions
+RUN mkdir -p /usr/share/fonts/truetype/custom && chmod -R 777 /usr/share/fonts/truetype/custom
 
 # Set environment variables
 ENV MPLCONFIGDIR=/app/mplconfig
