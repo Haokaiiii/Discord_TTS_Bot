@@ -24,6 +24,7 @@ import pandas as pd
 from pymongo import MongoClient
 from dotenv import load_dotenv
 from aiohttp import web
+import io
 
 DEBOUNCE_TIME = 2.0  # 等 2 秒看看用户还会不会继续切换
 pending_switch_tasks = {}  # 存储 (guild_id, member_id) -> asyncio.Task
@@ -1096,3 +1097,80 @@ async def cleanup_resources():
     
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
+
+@backoff.on_exception(
+    backoff.expo,
+    discord.errors.ConnectionClosed,
+    max_tries=5,
+    max_time=300
+)
+async def connect_to_voice_channel(channel):
+    """Connect to voice channel with retry mechanism"""
+    try:
+        return await channel.connect()
+    except Exception as e:
+        logging.error(f"Failed to connect to voice channel: {e}", exc_info=True)
+        raise
+
+async def cleanup_local_backups(backup_dir='data_backup', keep_latest=5):
+    """
+    Clean up local backup files after successful MongoDB upload
+    Args:
+        backup_dir: Directory containing backup files
+        keep_latest: Number of most recent backups to keep
+    """
+    try:
+        # Get all backup files
+        voice_stats_files = glob.glob(os.path.join(backup_dir, 'voice_stats_*.json'))
+        co_occurrence_files = glob.glob(os.path.join(backup_dir, 'co_occurrence_stats_*.json'))
+        
+        # Sort files by modification time
+        voice_stats_files.sort(key=os.path.getmtime, reverse=True)
+        co_occurrence_files.sort(key=os.path.getmtime, reverse=True)
+        
+        # Keep only the latest N files
+        files_to_delete = voice_stats_files[keep_latest:] + co_occurrence_files[keep_latest:]
+        
+        # Delete old files
+        for file in files_to_delete:
+            try:
+                os.remove(file)
+                logging.info(f"Deleted old backup file: {file}")
+            except OSError as e:
+                logging.error(f"Error deleting file {file}: {e}")
+                
+    except Exception as e:
+        logging.error(f"Error during backup cleanup: {e}", exc_info=True)
+
+async def save_data_periodically():
+    """Periodically save data to MongoDB and local backup"""
+    while True:
+        try:
+            # Save voice stats
+            backup_path = os.path.join('data_backup', f'voice_stats_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
+            with open(backup_path, 'w', encoding='utf-8') as f:
+                json.dump(voice_stats, f, ensure_ascii=False, indent=2)
+            logging.info(f"已创建本地备份: {backup_path}")
+            
+            # Save to MongoDB
+            await save_voice_stats_to_mongodb()
+            logging.info("语音统计数据已保存到MongoDB。")
+            
+            # Save co-occurrence stats
+            backup_path = os.path.join('data_backup', f'co_occurrence_stats_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
+            with open(backup_path, 'w', encoding='utf-8') as f:
+                json.dump(co_occurrence_stats, f, ensure_ascii=False, indent=2)
+            logging.info(f"已创建本地备份: {backup_path}")
+            
+            # Save to MongoDB
+            await save_co_occurrence_stats_to_mongodb()
+            logging.info("共同在线统计数据已保存。")
+            
+            # Cleanup old backups
+            await cleanup_local_backups()
+            
+            await asyncio.sleep(60)  # Save every minute
+            
+        except Exception as e:
+            logging.error(f"Error saving data: {e}", exc_info=True)
+            await asyncio.sleep(10)  # Shorter delay on error
