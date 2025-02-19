@@ -1,0 +1,59 @@
+# Build stage
+FROM python:3.10-slim as builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    python3-dev
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip wheel --no-cache-dir --no-deps --wheel-dir /app/wheels -r requirements.txt
+
+# Final stage
+FROM python:3.10-slim
+
+# Create non-root user
+RUN useradd -m -u 1000 botuser
+
+WORKDIR /app
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    fonts-wqy-zenhei \
+    ffmpeg \
+    libnss3 \
+    libasound2 \
+    fontconfig \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy wheels from builder
+COPY --from=builder /app/wheels /wheels
+COPY --from=builder /app/requirements.txt .
+
+# Install Python packages
+RUN pip install --no-cache /wheels/*
+
+# Copy application
+COPY . .
+
+# Create necessary directories with proper permissions
+RUN mkdir -p /app/tts_cache /app/data_backup /app/mplconfig \
+    && chown -R botuser:botuser /app
+
+# Set environment variables
+ENV MPLCONFIGDIR=/app/mplconfig
+ENV PYTHONUNBUFFERED=1
+ENV TZ=Australia/Sydney
+
+# Switch to non-root user
+USER botuser
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import requests; requests.get('http://localhost:8080/health')" || exit 1
+
+# Run application
+CMD ["python", "bot.py"]
