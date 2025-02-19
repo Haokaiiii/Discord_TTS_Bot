@@ -1,4 +1,3 @@
-
 # Discord Voice Activity Tracker Bot
 
 A **Discord bot** that tracks voice channel activity, generates statistics, and provides **Text-to-Speech (TTS)** notifications for channel events. Built with [discord.py](https://github.com/Rapptz/discord.py) and packaged via Docker.
@@ -16,8 +15,9 @@ A **Discord bot** that tracks voice channel activity, generates statistics, and 
   - Caches TTS files for improved performance and reduced latency  
 
 - **📊 Statistical Analysis**  
-  - Generates bar charts for voice activity rankings  
-  - Creates heatmaps of user co-presence  
+  - Generates **bar charts** for voice activity rankings  
+  - Creates **heatmaps** of user co-presence (both **absolute** and **relative** co-occurrence)  
+  - Automatically sorts heatmap axes by **total voice time** (descending), providing a more intuitive view  
   - Stores historical data in **MongoDB** (voice durations and co-occurrence stats)  
 
 - **🛡️ Robust Error Handling**  
@@ -114,7 +114,10 @@ Once the bot is online in your server, try out the following commands:
   Example: `!stats daily`
 
 - **`!show_relationships`**  
-  Generates a heatmap of the current server’s user co-presence (how long they spend together in voice channels).
+  Generates a **heatmap of absolute co-presence** in voice channels, sorted by each user's total voice time (largest to smallest).
+
+- **`!show_relationships_relative`**  
+  Generates a **relative** co-presence heatmap, showing the percentage of mutual time compared to each pair’s minimum total voice time, also sorted by total voice time.
 
 - **`!leave`**  
   Instructs the bot to leave the voice channel it’s currently connected to.
@@ -136,7 +139,7 @@ Once the bot is online in your server, try out the following commands:
 3. **Text-to-Speech Announcements**  
    - When a user joins, leaves, or switches channels, the bot generates a short TTS message using [gTTS](https://pypi.org/project/gTTS/).  
    - TTS output is cached (`tts_cache/`) to speed up subsequent plays of the same message.  
-   - Bot uses `discord.FFmpegPCMAudio` to stream these MP3 files in the voice channel.  
+   - The bot uses `discord.FFmpegPCMAudio` to stream these MP3 files in the voice channel.  
 
 4. **Scheduled Reports**  
    - The bot uses `apscheduler` to auto-generate daily, weekly, monthly, and yearly reports (at midnight or specified times).  
@@ -144,8 +147,10 @@ Once the bot is online in your server, try out the following commands:
    - Bar charts are created for top users, and activity data is then reset for the given period.  
 
 5. **Heatmap Generation**  
-   - The `!show_relationships` command triggers the creation of a heatmap for user co-occurrence in voice channels.  
-   - The heatmap is posted as an image in the server.  
+   - The `!show_relationships` command triggers the creation of an **absolute** heatmap for user co-occurrence in voice channels.  
+   - The `!show_relationships_relative` command triggers a **relative** heatmap, showing co-presence as a percentage (0–100%).  
+   - Both heatmaps are automatically **sorted** by total user voice time in **descending** order.  
+   - The resulting heatmap is posted as an image in the server.
 
 ## Contributing
 
@@ -176,4 +181,3 @@ This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) f
 - **Author**: [Haokai Tan](https://github.com/Haokaiiii)  
 - **Repository**: [GitHub](https://github.com/yourusername/discord-voice-tracker.git)  
 - For issues, please open a ticket in the GitHub [Issues](https://github.com/yourusername/discord-voice-tracker/issues) section.
-
