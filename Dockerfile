@@ -20,13 +20,13 @@ RUN useradd -m -u 1000 botuser
 
 WORKDIR /app
 
-# Install runtime dependencies
+# Install runtime dependencies and fonts
 RUN apt-get update && apt-get install -y \
-    fonts-wqy-zenhei \
     ffmpeg \
     libnss3 \
     libasound2 \
     fontconfig \
+    fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy wheels from builder
@@ -39,14 +39,18 @@ RUN pip install --no-cache /wheels/*
 # Copy application
 COPY . .
 
-# Create necessary directories with proper permissions
+# Create necessary directories and set permissions
 RUN mkdir -p /app/tts_cache /app/data_backup /app/mplconfig \
-    && chown -R botuser:botuser /app
+    && chown -R botuser:botuser /app \
+    && chmod -R 755 /app
 
 # Set environment variables
 ENV MPLCONFIGDIR=/app/mplconfig
 ENV PYTHONUNBUFFERED=1
 ENV TZ=Australia/Sydney
+
+# Rebuild font cache
+RUN fc-cache -fv
 
 # Switch to non-root user
 USER botuser

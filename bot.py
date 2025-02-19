@@ -27,6 +27,11 @@ from pymongo import MongoClient
 from dotenv import load_dotenv
 from aiohttp import web
 import io
+import warnings
+import matplotlib
+import subprocess
+
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
 
 DEBOUNCE_TIME = 2.0  # 等 2 秒看看用户还会不会继续切换
 pending_switch_tasks = {}  # 存储 (guild_id, member_id) -> asyncio.Task
@@ -38,18 +43,32 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ---------------- 字体与样式设置 ----------------
+matplotlib.use('Agg')  # Use Agg backend
 
-font_path = '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc'
-if os.path.exists(font_path):
-    font_prop = fm.FontProperties(fname=font_path)
-    plt.rcParams['font.sans-serif'] = [font_prop.get_name()]
-    plt.rcParams['font.family'] = 'sans-serif'
-    plt.rcParams['axes.unicode_minus'] = False
-    # 这里也可以用更完整的 set_theme
-    sns.set_theme(style="whitegrid", font=font_prop.get_name())
-else:
-    logging.warning(f"字体文件 {font_path} 不存在。将使用默认字体。")
-    sns.set_theme(style="whitegrid")
+# Debug font paths and cache
+logging.info("Font debugging information:")
+logging.info(f"Font cache path: {matplotlib.get_cachedir()}")
+logging.info(f"Matplotlib config path: {matplotlib.get_configdir()}")
+
+# List all font files in the system
+font_files = subprocess.run(['fc-list'], capture_output=True, text=True)
+logging.info("Available font files:")
+logging.info(font_files.stdout)
+
+# Configure fonts
+plt.rcParams['font.family'] = 'Noto Sans CJK SC'
+plt.rcParams['font.sans-serif'] = ['Noto Sans CJK SC']
+plt.rcParams['axes.unicode_minus'] = False
+
+# Set Seaborn style
+sns.set_theme(style="whitegrid")
+
+# Verify font configuration
+font_list = [f.name for f in matplotlib.font_manager.fontManager.ttflist]
+logging.info(f"Available matplotlib fonts: {font_list}")
+
+# Force font manager to rebuild the font cache
+matplotlib.font_manager._rebuild()
 
 # ---------------- 初始化 Bot ----------------
 intents = discord.Intents.default()
@@ -771,7 +790,7 @@ async def show_relationships(ctx):
 async def generate_co_occurrence_heatmap(guild_id):
     """Generate a heatmap showing how often users are in voice channels together,
        只考虑总时长排名前30 + daily前20 + 最近加入者。
-       并且最终对坐标轴按照“总时长”从大到小进行排序。
+       并且最终对坐标轴按照"总时长"从大到小进行排序。
     """
     try:
         # 1) 获取共同在线统计
@@ -836,7 +855,7 @@ async def generate_co_occurrence_heatmap(guild_id):
             final_users.add(u2)
         final_users = list(final_users)
 
-        # **重点**: 按“总时长”从大到小排序
+        # **重点**: 按"总时长"从大到小排序
         final_users = sorted(
             final_users,
             key=lambda uid: guild_voice_stat[uid]['total'] if uid in guild_voice_stat else 0,
@@ -910,7 +929,7 @@ async def generate_co_occurrence_heatmap(guild_id):
 async def show_relationships_relative(ctx):
     """
     命令: !show_relationships_relative
-    生成基于“相对关系(%)”的共同语音热图，并发送图片。
+    生成基于"相对关系(%)"的共同语音热图，并发送图片。
     """
     try:
         buf, error = await generate_co_occurrence_heatmap_relative(ctx.guild.id)
@@ -925,9 +944,9 @@ async def show_relationships_relative(ctx):
 
 async def generate_co_occurrence_heatmap_relative(guild_id):
     """
-    生成显示“共同时长在双方最小总时长中的占比(%)”的热图(0%~100%)，
+    生成显示"共同时长在双方最小总时长中的占比(%)",
     同样只考虑: 总时长排名前30 + daily排名前20 + 最近加入者，
-    最后按照“总时长”从大到小排序坐标轴。
+    最后按照"总时长"从大到小排序坐标轴。
     """
     try:
         # 1) 获取共同在线统计
@@ -990,7 +1009,7 @@ async def generate_co_occurrence_heatmap_relative(guild_id):
             final_users.add(u2)
         final_users = list(final_users)
 
-        # **按照“总时长”从大到小**排序
+        # **按照"总时长"从大到小**排序
         final_users = sorted(
             final_users,
             key=lambda uid: guild_voice_stat[uid]['total'] if uid in guild_voice_stat else 0,

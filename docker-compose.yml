@@ -10,8 +10,9 @@ services:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
       - MONGODB_URI=${MONGODB_URI}
     volumes:
-      - ./data:/app/data_backup
-      - ./logs:/app/logs
+      - ./data:/app/data_backup:rw
+      - ./logs:/app/logs:rw
+      - ./tts_cache:/app/tts_cache:rw
     healthcheck:
       test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8080/health')"]
       interval: 30s
