@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   disbot:
-    image: yourdockerhubusername/disbot:latest
+    image: haokaiii/disbot:latest
     # or if building locally:
     # build: .
     restart: unless-stopped
