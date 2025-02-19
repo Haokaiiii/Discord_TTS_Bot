@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   disbot:
-    image: haokaiii/disbot:latest
+    image: haokaiii/Discord_TTS_bot:latest
     # or if building locally:
     # build: .
     restart: unless-stopped
