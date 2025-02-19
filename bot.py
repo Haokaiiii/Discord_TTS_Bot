@@ -1,3 +1,5 @@
+# bot.py
+
 import os
 import discord
 from discord.ext import commands, tasks
@@ -43,10 +45,11 @@ if os.path.exists(font_path):
     plt.rcParams['font.sans-serif'] = [font_prop.get_name()]
     plt.rcParams['font.family'] = 'sans-serif'
     plt.rcParams['axes.unicode_minus'] = False
-    sns.set(style="whitegrid", font=font_prop.get_name())
+    # 这里也可以用更完整的 set_theme
+    sns.set_theme(style="whitegrid", font=font_prop.get_name())
 else:
     logging.warning(f"字体文件 {font_path} 不存在。将使用默认字体。")
-    sns.set(style="whitegrid")
+    sns.set_theme(style="whitegrid")
 
 # ---------------- 初始化 Bot ----------------
 intents = discord.Intents.default()
@@ -81,7 +84,7 @@ co_occurrence_col = db['co_occurrence_stats']
 
 voice_activity = {}       # {guild_id: {member_id: join_time}}
 voice_stats = {}          # {guild_id: {member_id: {total, daily, weekly, monthly, yearly}}}
-co_occurrence_stats = {}  # {guild_id: {(m1, m2): seconds}, m1<m2}
+co_occurrence_stats = {}  # {guild_id: {(m1, m2): seconds}, where (m1, m2) is tuple(m1<m2)}
 channel_users = {}        # {guild_id: {channel_id: {member_id: join_time}}}
 
 FFMPEG_EXECUTABLE = "ffmpeg"
@@ -144,7 +147,7 @@ async def save_voice_stats():
             logging.info("语音统计数据已保存到MongoDB。")
         except Exception as e:
             logging.error(f"保存语音统计数据时出错: {e}")
-            raise  # 让backoff进行重试
+            raise  # 让 backoff 进行重试
 
 @backoff.on_exception(
     backoff.expo,
@@ -179,7 +182,7 @@ async def save_co_occurrence_stats():
             logging.info("共同在线统计数据已保存。")
         except Exception as e:
             logging.error(f"保存共同在线统计数据时出错: {e}")
-            raise  # 让backoff进行重试
+            raise  # 让 backoff 进行重试
 
 def load_voice_stats():
     """从 MongoDB 加载语音统计数据"""
@@ -227,6 +230,7 @@ def load_co_occurrence_stats():
 
 @bot.event
 async def on_member_update(before, after):
+    # 如果昵称改变，可以播报 TTS
     if before.nick != after.nick:
         guild = after.guild
         guild_id = guild.id
@@ -254,10 +258,10 @@ async def on_ready():
             # 强制刷新成员缓存
             await guild.chunk()
             members = guild.members
-            logging.info(f"已获取并缓存 {guild.name} 服务器的所有成员。总成员数: {len(members)}")
+            logging.info(f"已获取并缓存 {guild.name} 的所有成员，总数: {len(members)}")
         except Exception as e:
             logging.error(f"获取服务器 {guild.name} 的成员时出错: {e}")
-            members = guild.members  # 使用缓存的成员
+            members = guild.members
 
         if guild.id not in guild_tts_queues:
             guild_tts_queues[guild.id] = asyncio.Queue()
@@ -273,8 +277,7 @@ async def on_ready():
                 ch_id = member.voice.channel.id
                 channel_users[guild_id].setdefault(ch_id, {})
                 channel_users[guild_id][ch_id][member_id] = now
-                logging.info(f"初始化用户 {get_preferred_name(member)} 当前在语音频道 {member.voice.channel.name} 中。")
-                logging.info(f"获取成员昵称: ID={member.id}, Username={member.name}, Nickname={member.nick}, DisplayName={member.display_name}")
+                logging.info(f"初始化用户 {get_preferred_name(member)} 在语音频道 {member.voice.channel.name}")
 
     logging.info("所有服务器的 TTS 处理任务已启动。")
     scheduler.start()
@@ -286,24 +289,16 @@ async def on_ready():
 def get_preferred_name(member):
     """
     返回成员的首选显示名称：
-    1. 服务器昵称
-    2. 通用昵称
-    3. 用户名
+    1. 服务器昵称 (nick)
+    2. 通用昵称 (global_name，部分版本Discord有这个属性)
+    3. 用户名 (name)
     """
-    # 检查服务器昵称
     if member.nick:
-        logging.debug(f"成员 {member.id} 使用服务器昵称: {member.nick}")
         return member.nick
-    # 检查通用昵称
     elif hasattr(member, 'global_name') and member.global_name:
-        logging.debug(f"成员 {member.id} 使用通用昵称: {member.global_name}")
         return member.global_name
-    # 默认回退到用户名
     else:
-        logging.debug(f"成员 {member.id} 没有服务器昵称或通用昵称，使用用户名: {member.name}")
         return member.name
-
-
 
 @bot.command()
 async def check_nickname(ctx, member: discord.Member = None):
@@ -313,7 +308,6 @@ async def check_nickname(ctx, member: discord.Member = None):
     name = get_preferred_name(member)
     await ctx.send(f"成员 {member.id} 的首选名称: {name}")
     logging.info(f"检查成员: ID={member.id}, Username={member.name}, Nickname={member.nick}, DisplayName={member.display_name}")
-
 
 @bot.event
 async def on_guild_join(guild):
@@ -406,7 +400,7 @@ async def on_voice_state_update(member, before, after):
 
             ch_id = before.channel.id
             if guild_id in channel_users and ch_id in channel_users[guild_id]:
-                for other_id, other_join_time in channel_users[guild_id][ch_id].items():
+                for other_id, other_join_time in list(channel_users[guild_id][ch_id].items()):
                     if other_id != member_id:
                         co_start = max(join_time, other_join_time)
                         co_duration = (now - co_start).total_seconds()
@@ -433,7 +427,7 @@ async def on_voice_state_update(member, before, after):
             new_ch_id = after.channel.id
             # 计算旧频道共同时长
             if guild_id in channel_users and old_ch_id in channel_users[guild_id]:
-                for other_id, other_join_time in channel_users[guild_id][old_ch_id].items():
+                for other_id, other_join_time in list(channel_users[guild_id][old_ch_id].items()):
                     if other_id != member_id:
                         co_start = max(join_time, other_join_time)
                         co_duration = (now - co_start).total_seconds()
@@ -460,7 +454,6 @@ async def handle_voice_event(guild, member, before, after, event_type):
         # 获取最新的成员信息
         member = await guild.fetch_member(member.id)
         name = get_preferred_name(member)
-        logging.debug(f"Fetched member: ID={member.id}, PreferredName={name}")
     except discord.NotFound:
         logging.warning(f"成员未找到或已离开: ID={member.id}")
         return
@@ -475,12 +468,10 @@ async def handle_voice_event(guild, member, before, after, event_type):
         old_task = pending_switch_tasks.get(key)
         if old_task and not old_task.done():
             old_task.cancel()
-            logging.debug(f"取消旧的 switch 任务 for {name}")
 
         # 启动一个新的延迟任务
         t = asyncio.create_task(delayed_switch_broadcast(guild, member, after.channel))
         pending_switch_tasks[key] = t
-        logging.debug(f"启动新的 switch 任务 for {name}")
         return  # 不立即播报
 
     elif event_type == 'leave':
@@ -492,8 +483,6 @@ async def handle_voice_event(guild, member, before, after, event_type):
     else:
         return
 
-    logging.debug(f"将消息 '{message}' 放入 TTS 队列。")
-    # 将消息放入队列
     await queue_tts(guild, voice_channel, message)
 
 async def delayed_switch_broadcast(guild, member, voice_channel):
@@ -507,7 +496,6 @@ async def delayed_switch_broadcast(guild, member, voice_channel):
         logging.info(f"用户 {get_preferred_name(member)} 的 switch TTS 被新的切换事件取消。")
         return
 
-    # 延时结束，说明用户暂时没再切频道，播一次 TTS
     message = f"{get_preferred_name(member)} 叛变了！"
     await queue_tts(guild, voice_channel, message)
 
@@ -520,13 +508,12 @@ async def queue_tts(guild, voice_channel, message):
     if not os.path.exists(tts_path) or os.path.getsize(tts_path) == 0:
         await generate_tts(tts_message, tts_path)
 
-    # 将要播放的信息放入队列
     await guild_tts_queues[guild.id].put({
         'guild': guild,
         'voice_channel': voice_channel,
         'message': message,
         'tts_path': tts_path,
-        'member': None  # switch场景下可选，或保留member信息
+        'member': None
     })
 
 def has_required_permissions(channel):
@@ -564,6 +551,7 @@ async def process_guild_tts_queue(guild_id):
             guild_tts_queues[guild_id].task_done()
 
 async def ensure_voice_connected(voice_client, voice_channel, max_tries=15, initial_delay=3.0):
+    """Example helper for re-connecting to a voice channel if needed"""
     delay = initial_delay
     for i in range(max_tries):
         try:
@@ -611,17 +599,16 @@ async def handle_tts_task(task):
         for channel in guild.text_channels:
             if has_required_permissions(channel):
                 text_channel = channel
-                logging.info(f"使用频道 '{channel.name}' 发送消息。")
                 break
 
     if not text_channel:
         logging.warning(f"在服务器 '{guild.name}' 中未找到可发送消息的文本频道。")
         return
 
-    # 先发送文本消息
+    # 先发送文本消息 (可选删除机制)
     try:
         await text_channel.send(message_content, delete_after=5)
-        logging.info(f"已发送并设置删除的文本消息: '{message_content}'")
+        logging.info(f"已发送文本消息: '{message_content}' (5秒后删除)")
     except Exception as e:
         logging.error(f"发送文本消息失败: {e}")
         return
@@ -636,15 +623,13 @@ async def handle_tts_task(task):
             guild_voice_clients[guild.id] = voice_client
             logging.info(f"已连接到语音频道: '{voice_channel.name}'")
         except discord.ClientException as e:
-            # 这里捕获 "Already connected..." 的错误
             if "Already connected to a voice channel" in str(e):
-                logging.error("已经连接到其他语音频道，尝试强制断开并重连...")
+                logging.error("已经连接到其他语音频道，尝试断开并重连...")
                 try:
                     if voice_client and voice_client.is_connected():
                         await voice_client.disconnect(force=True)
                     voice_client = await voice_channel.connect()
                     guild_voice_clients[guild.id] = voice_client
-                    logging.info(f"重连到语音频道: '{voice_channel.name}'")
                 except Exception as reconnect_err:
                     logging.error(f"强制断开并重连失败: {reconnect_err}")
                     return
@@ -661,36 +646,21 @@ async def handle_tts_task(task):
                 await voice_client.move_to(voice_channel)
                 logging.info(f"已移动到语音频道: '{voice_channel.name}'")
             except discord.ClientException as e:
-                # 同样捕获 "Already connected..." 错误
                 if "Already connected to a voice channel" in str(e):
                     logging.error("移动到语音频道失败: Already connected. 尝试强制断开并重连.")
                     try:
                         await voice_client.disconnect(force=True)
-                        logging.info("已断开旧的语音连接，准备重连")
                         voice_client = await voice_channel.connect()
                         guild_voice_clients[guild.id] = voice_client
-                        logging.info(f"重连到语音频道: '{voice_channel.name}'")
                     except Exception as reconnect_err:
                         logging.error(f"重连到语音频道失败: {reconnect_err}")
                         return
                 else:
-                    logging.error(f"移动到语音频道失败，出现其他ClientException: {e}")
+                    logging.error(f"移动到语音频道失败: {e}")
                     return
             except Exception as move_err:
                 logging.error(f"移动到语音频道时发生错误: {move_err}")
                 return
-
-    # 等待一些时间，确保已经连上
-    max_retries = 5
-    for i in range(max_retries):
-        if voice_client.is_connected():
-            break
-        await asyncio.sleep(0.5)
-        logging.debug(f"等待连接完成，重试 is_connected() 第 {i+1}/{max_retries} 次...")
-
-    if not voice_client.is_connected():
-        logging.error("在播放前检测到仍未成功连接到语音频道，放弃播放。")
-        return
 
     # 检查 TTS 文件
     if not os.path.exists(tts_path) or os.path.getsize(tts_path) == 0:
@@ -717,36 +687,30 @@ async def handle_tts_task(task):
     while voice_client.is_playing():
         await asyncio.sleep(0.1)
 
-# ---------------- Bot 命令 (只保留一份) ----------------
+# ---------------- Bot 命令 ----------------
 @bot.command()
 async def leave(ctx):
     """让机器人离开当前语音频道"""
     guild = ctx.guild
-    logging.info(f"收到命令: leave from {ctx.author} in {guild.name}")
-
     voice_client = guild_voice_clients.get(guild.id)
     if voice_client and voice_client.is_connected():
         try:
             await voice_client.disconnect()
             del guild_voice_clients[guild.id]
             await ctx.send("已离开语音频道。", delete_after=5)
-            logging.info(f"已从语音频道 '{voice_client.channel.name}' 离开。")
         except Exception as e:
             await ctx.send("无法离开语音频道。", delete_after=5)
             logging.error(f"离开语音频道失败: {e}")
     else:
         await ctx.send("机器人当前不在任何语音频道。", delete_after=5)
-        logging.info("机器人当前不在任何语音频道。")
 
 @bot.command()
 async def test_delete(ctx):
     """测试消息删除功能"""
     try:
         await ctx.send("这是一条测试消息，将在5秒后删除。", delete_after=5)
-        logging.info("已发送测试删除消息。")
     except Exception as e:
         await ctx.send(f"删除失败: {e}", delete_after=5)
-        logging.error(f"测试删除消息失败: {e}")
 
 @bot.command()
 async def play_test(ctx):
@@ -758,7 +722,6 @@ async def play_test(ctx):
             try:
                 voice_client = await ctx.author.voice.channel.connect()
                 guild_voice_clients[guild.id] = voice_client
-                logging.info(f"已连接到语音频道: '{ctx.author.voice.channel.name}'")
             except Exception as e:
                 logging.error(f"无法连接到语音频道: {e}")
                 await ctx.send("无法连接到语音频道。")
@@ -781,17 +744,332 @@ async def play_test(ctx):
         if not voice_client.is_playing():
             voice_client.play(audio_source)
             await ctx.send("正在播放测试音频。", delete_after=5)
-            logging.info(f"开始播放测试音频: {test_audio_path}")
         else:
             await ctx.send("语音客户端正在播放其他音频。", delete_after=5)
     except Exception as e:
         logging.error(f"播放测试音频失败: {e}")
         await ctx.send("播放测试音频失败。", delete_after=5)
 
+
+# -------------------------------------------------------------------
+# 生成共同在线热图 (绝对时长)
+# -------------------------------------------------------------------
 @bot.command()
 async def show_relationships(ctx):
-    """显示当前服务器成员的共同在线时间热力图"""
-    await generate_co_occurrence_heatmap(ctx.guild)
+    """Show a heatmap of how often users are in voice channels together (绝对时长)"""
+    try:
+        buf, error = await generate_co_occurrence_heatmap(ctx.guild.id)
+        if error:
+            await ctx.send(error)
+            return
+        file = discord.File(buf, filename='relationships.png')
+        await ctx.send(file=file)
+    except Exception as e:
+        logging.error(f"Error in show_relationships: {e}", exc_info=True)
+        await ctx.send(f"Error generating relationship visualization: {str(e)}")
+
+async def generate_co_occurrence_heatmap(guild_id):
+    """Generate a heatmap showing how often users are in voice channels together,
+       只考虑总时长排名前30 + daily前20 + 最近加入者。
+       并且最终对坐标轴按照“总时长”从大到小进行排序。
+    """
+    try:
+        # 1) 获取共同在线统计
+        stats = co_occurrence_stats.get(guild_id, {})
+        if not stats:
+            return None, "No co-occurrence data available."
+        
+        # 2) 从 voice_stats 中筛选用户
+        guild_voice_stat = voice_stats.get(guild_id, {})
+        if not guild_voice_stat:
+            return None, "No voice_stats data for this guild."
+
+        # 2.1) 总时长排名前30
+        ranked_by_total = sorted(
+            guild_voice_stat.items(),
+            key=lambda x: x[1]['total'],
+            reverse=True
+        )
+        top_30_total_ids = [member_id for member_id, _ in ranked_by_total[:30]]
+
+        # 2.2) daily 排名前20
+        ranked_by_daily = sorted(
+            guild_voice_stat.items(),
+            key=lambda x: x[1]['daily'],
+            reverse=True
+        )
+        top_20_daily_ids = [member_id for member_id, _ in ranked_by_daily[:20]]
+
+        # 2.3) 最近加入的成员
+        guild_obj = bot.get_guild(guild_id)
+        if guild_obj is None:
+            return None, "Guild not found."
+
+        members_with_joined = [m for m in guild_obj.members if m.joined_at]
+        if members_with_joined:
+            last_joined_member = max(members_with_joined, key=lambda m: m.joined_at)
+            last_joined_id = last_joined_member.id
+        else:
+            last_joined_id = None
+
+        # 合并
+        selected_ids = set(top_30_total_ids + top_20_daily_ids)
+        if last_joined_id is not None:
+            selected_ids.add(last_joined_id)
+
+        if len(selected_ids) < 2:
+            return None, "Not enough users to generate a meaningful heatmap."
+
+        # 3) 过滤共同在线数据
+        filtered_stats = {}
+        for (u1, u2), seconds in stats.items():
+            if u1 in selected_ids and u2 in selected_ids:
+                filtered_stats[(u1, u2)] = seconds
+
+        if not filtered_stats:
+            return None, "No co-occurrence data available after filtering."
+
+        # 4) 收集最终用户列表
+        final_users = set()
+        for (u1, u2) in filtered_stats.keys():
+            final_users.add(u1)
+            final_users.add(u2)
+        final_users = list(final_users)
+
+        # **重点**: 按“总时长”从大到小排序
+        final_users = sorted(
+            final_users,
+            key=lambda uid: guild_voice_stat[uid]['total'] if uid in guild_voice_stat else 0,
+            reverse=True
+        )
+
+        # 5) 构建矩阵（单位：小时）
+        n = len(final_users)
+        matrix = np.zeros((n, n), dtype=float)
+        idx_map = {uid: i for i, uid in enumerate(final_users)}
+
+        for (u1, u2), seconds in filtered_stats.items():
+            i = idx_map[u1]
+            j = idx_map[u2]
+            hours = seconds / 3600.0
+            matrix[i][j] = hours
+            matrix[j][i] = hours
+
+        # 6) 生成坐标标签
+        labels = []
+        for uid in final_users:
+            m = guild_obj.get_member(uid)
+            labels.append(get_preferred_name(m) if m else str(uid))
+
+        # 7) 绘图
+        count = len(labels)
+        fig_width = max(6, min(24, count * 0.8))
+        fig_height = max(6, min(24, count * 0.8))
+
+        plt.figure(figsize=(fig_width, fig_height))
+
+        if count <= 10:
+            tick_fontsize = 14
+        elif count <= 30:
+            tick_fontsize = 12
+        else:
+            tick_fontsize = 8
+
+        sns.heatmap(
+            matrix,
+            xticklabels=labels,
+            yticklabels=labels,
+            cmap='rocket_r',
+            annot=False,
+            linewidths=.5,
+            square=True,
+            cbar_kws={"shrink": .8, "label": "共同在线时长（小时）"}
+        )
+
+        plt.title('Voice Channel Co-Presence (Hours)', fontsize=16)
+        plt.xticks(rotation=45, ha='right', fontsize=tick_fontsize)
+        plt.yticks(rotation=0, fontsize=tick_fontsize)
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+        plt.close()
+
+        return buf, None
+
+    except Exception as e:
+        logging.error(f"Error generating heatmap: {e}", exc_info=True)
+        return None, f"Error generating heatmap: {str(e)}"
+
+
+# -------------------------------------------------------------------
+# 生成共同在线热图 (相对时长)
+# -------------------------------------------------------------------
+@bot.command()
+async def show_relationships_relative(ctx):
+    """
+    命令: !show_relationships_relative
+    生成基于“相对关系(%)”的共同语音热图，并发送图片。
+    """
+    try:
+        buf, error = await generate_co_occurrence_heatmap_relative(ctx.guild.id)
+        if error:
+            await ctx.send(error)
+        else:
+            file = discord.File(buf, filename='relative_relationships.png')
+            await ctx.send(file=file)
+    except Exception as e:
+        logging.error(f"Error in show_relationships_relative: {e}", exc_info=True)
+        await ctx.send(f"Error generating relative relationship visualization: {str(e)}")
+
+async def generate_co_occurrence_heatmap_relative(guild_id):
+    """
+    生成显示“共同时长在双方最小总时长中的占比(%)”的热图(0%~100%)，
+    同样只考虑: 总时长排名前30 + daily排名前20 + 最近加入者，
+    最后按照“总时长”从大到小排序坐标轴。
+    """
+    try:
+        # 1) 获取共同在线统计
+        stats = co_occurrence_stats.get(guild_id, {})
+        if not stats:
+            return None, "No co-occurrence data available."
+        
+        # 2) 从 voice_stats 中筛选用户
+        guild_voice_stat = voice_stats.get(guild_id, {})
+        if not guild_voice_stat:
+            return None, "No voice_stats data for this guild."
+
+        # 2.1) 总时长排名前30
+        ranked_by_total = sorted(
+            guild_voice_stat.items(),
+            key=lambda x: x[1]['total'],
+            reverse=True
+        )
+        top_30_total_ids = [member_id for member_id, _ in ranked_by_total[:30]]
+
+        # 2.2) daily 排名前20
+        ranked_by_daily = sorted(
+            guild_voice_stat.items(),
+            key=lambda x: x[1]['daily'],
+            reverse=True
+        )
+        top_20_daily_ids = [member_id for member_id, _ in ranked_by_daily[:20]]
+
+        # 2.3) 最近加入者
+        guild_obj = bot.get_guild(guild_id)
+        if guild_obj is None:
+            return None, "Guild not found."
+        members_with_joined = [m for m in guild_obj.members if m.joined_at]
+        if members_with_joined:
+            last_joined_member = max(members_with_joined, key=lambda m: m.joined_at)
+            last_joined_id = last_joined_member.id
+        else:
+            last_joined_id = None
+
+        selected_ids = set(top_30_total_ids + top_20_daily_ids)
+        if last_joined_id is not None:
+            selected_ids.add(last_joined_id)
+
+        if len(selected_ids) < 2:
+            return None, "Not enough users to generate a meaningful heatmap."
+
+        # 3) 过滤数据
+        filtered_stats = {}
+        for (u1, u2), co_seconds in stats.items():
+            if u1 in selected_ids and u2 in selected_ids:
+                filtered_stats[(u1, u2)] = co_seconds
+
+        if not filtered_stats:
+            return None, "No co-occurrence data available after filtering."
+
+        # 4) 收集并排序
+        final_users = set()
+        for (u1, u2) in filtered_stats.keys():
+            final_users.add(u1)
+            final_users.add(u2)
+        final_users = list(final_users)
+
+        # **按照“总时长”从大到小**排序
+        final_users = sorted(
+            final_users,
+            key=lambda uid: guild_voice_stat[uid]['total'] if uid in guild_voice_stat else 0,
+            reverse=True
+        )
+
+        # 5) 构建矩阵 (相对关系, 0%~100%)
+        n = len(final_users)
+        matrix = np.zeros((n, n), dtype=float)
+        idx_map = {uid: i for i, uid in enumerate(final_users)}
+
+        for (u1, u2), co_seconds in filtered_stats.items():
+            i = idx_map[u1]
+            j = idx_map[u2]
+            co_hours = co_seconds / 3600.0
+
+            total_u1_hrs = guild_voice_stat[u1]['total'] / 3600.0 if u1 in guild_voice_stat else 0
+            total_u2_hrs = guild_voice_stat[u2]['total'] / 3600.0 if u2 in guild_voice_stat else 0
+
+            denominator = min(total_u1_hrs, total_u2_hrs)
+            if denominator <= 0:
+                ratio_percent = 0.0
+            else:
+                ratio_percent = (co_hours / denominator) * 100.0
+                if ratio_percent > 100:
+                    ratio_percent = 100
+
+            matrix[i][j] = ratio_percent
+            matrix[j][i] = ratio_percent
+
+        # 6) 坐标标签
+        labels = []
+        for uid in final_users:
+            m = guild_obj.get_member(uid)
+            labels.append(get_preferred_name(m) if m else str(uid))
+
+        # 7) 绘图
+        count = len(labels)
+        fig_width = max(6, min(24, count * 0.8))
+        fig_height = max(6, min(24, count * 0.8))
+
+        plt.figure(figsize=(fig_width, fig_height))
+
+        if count <= 10:
+            tick_fontsize = 14
+        elif count <= 30:
+            tick_fontsize = 12
+        else:
+            tick_fontsize = 8
+
+        sns.heatmap(
+            matrix,
+            xticklabels=labels,
+            yticklabels=labels,
+            cmap='flare',
+            annot=False,
+            vmin=0,
+            vmax=100,
+            linewidths=.5,
+            square=True,
+            cbar_kws={"shrink": .8, "label": "共同时长 / 最小总时长 (%)"}
+        )
+
+        plt.title('Relative Co-Presence (%)', fontsize=16)
+        plt.xticks(rotation=45, ha='right', fontsize=tick_fontsize)
+        plt.yticks(rotation=0, fontsize=tick_fontsize)
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+        plt.close()
+
+        return buf, None
+        
+    except Exception as e:
+        logging.error(f"Error generating relative heatmap: {e}", exc_info=True)
+        return None, f"Error generating relative heatmap: {str(e)}"
+
 
 @bot.command()
 async def stats(ctx, period: str):
@@ -883,7 +1161,7 @@ def schedule_reports():
 async def generate_report(period, ctx_guild=None):
     """
     生成指定 period 的排行榜报告并发送到文本频道。
-    如果 ctx_guild 不为空，则只针对这个 Guild；如果为空，则对所有 Bot 所在的服务器生成周期性报告。
+    如果 ctx_guild 不为空，则只针对这个 Guild；如果为空，则对所有服务器生成周期报告。
     """
     guilds = [ctx_guild] if ctx_guild else bot.guilds
     for guild in guilds:
@@ -915,7 +1193,6 @@ async def generate_report(period, ctx_guild=None):
             for channel in guild.text_channels:
                 if has_required_permissions(channel):
                     text_channel = channel
-                    logging.info(f"使用频道 '{channel.name}' 发送报告。")
                     break
 
         if text_channel:
@@ -959,17 +1236,34 @@ async def generate_periodic_chart(guild, period):
         member = guild.get_member(member_id)
         if member:
             members.append(get_preferred_name(member))
-            durations.append(data[period] / 3600)
+            durations.append(data[period] / 3600.0)
 
     if not members:
-        logging.info(f"没有成员数据可用于生成 {period} 报告在服务器 '{guild.name}'。")
         return
 
+    # 设置更好看的主题和大小
+    sns.set_theme(style="whitegrid", context="talk")
     plt.figure(figsize=(12, 8))
-    sns.barplot(x=durations, y=members, palette="viridis", edgecolor='black')
+
+    # 自定义调色板
+    colors = sns.color_palette("Spectral", n_colors=len(durations))
+
+    ax = sns.barplot(x=durations, y=members, palette=colors, edgecolor='black')
     plt.xlabel('语音时长 (小时)', fontsize=14)
     plt.ylabel('成员', fontsize=14)
     plt.title(title, fontsize=16)
+
+    # 在柱子上显示数值标签
+    for i, v in enumerate(durations):
+        ax.text(
+            v + 0.1,  # x轴稍微往右
+            i,        # 第 i 条
+            f"{v:.1f}h",
+            color='black',
+            va='center',
+            fontsize=10
+        )
+
     plt.tight_layout()
 
     image_path = os.path.join(TTS_CACHE_DIR, f"{period}_report_{guild_id}.png")
@@ -1010,10 +1304,8 @@ async def handle_command_error(ctx, error):
         logging.error(f"Command error in {ctx.command}: {error}", exc_info=True)
         await ctx.send("An error occurred while processing your command.")
 
-# Add to your bot setup:
 bot.on_command_error = handle_command_error
 
-# ---------------- 主程序启动 ----------------
 @backoff.on_exception(
     backoff.expo,
     (discord.errors.ConnectionClosed, aiohttp.ClientConnectorError),
@@ -1023,7 +1315,7 @@ async def run_bot():
     await bot.start(os.getenv('DISCORD_TOKEN'))
 
 async def health_check(request):
-    """Health check endpoint for Docker"""
+    """Health check endpoint for Docker or service monitoring"""
     return web.Response(text="OK", status=200)
 
 async def start_health_server():
@@ -1036,7 +1328,7 @@ async def start_health_server():
 
 async def main():
     try:
-        await start_health_server()  # Start health check server
+        await start_health_server()
         await run_bot()
     except Exception as e:
         logging.error(f"Bot runtime error: {e}", exc_info=True)
@@ -1053,124 +1345,3 @@ if __name__ == "__main__":
             asyncio.run(main())
         except Exception as e:
             logging.error(f"主程序运行时发生异常: {e}")
-
-class ConnectionManager:
-    def __init__(self, max_retries=5, base_delay=1):
-        self.max_retries = max_retries
-        self.base_delay = base_delay
-        self._retry_count = 0
-
-    async def connect(self, func, *args, **kwargs):
-        while self._retry_count < self.max_retries:
-            try:
-                return await func(*args, **kwargs)
-            except (discord.errors.ConnectionClosed, 
-                   aiohttp.ClientConnectorError) as e:
-                self._retry_count += 1
-                delay = self.base_delay * (2 ** self._retry_count)
-                logging.warning(f"Connection attempt {self._retry_count} failed: {e}")
-                if self._retry_count < self.max_retries:
-                    logging.info(f"Retrying in {delay} seconds...")
-                    await asyncio.sleep(delay)
-                else:
-                    raise BotException("Max connection retries reached")
-
-async def cleanup_resources():
-    """Cleanup function for graceful shutdown"""
-    tasks = []
-    # Cleanup voice clients
-    for voice_client in guild_voice_clients.values():
-        if voice_client and voice_client.is_connected():
-            tasks.append(voice_client.disconnect())
-    
-    # Cancel ongoing tasks
-    for task in guild_tts_tasks.values():
-        if not task.done():
-            task.cancel()
-    
-    # Cleanup temporary files
-    for file in glob.glob(os.path.join(TTS_CACHE_DIR, "*.mp3")):
-        try:
-            os.remove(file)
-        except Exception as e:
-            logging.error(f"Failed to remove temporary file {file}: {e}")
-    
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-@backoff.on_exception(
-    backoff.expo,
-    discord.errors.ConnectionClosed,
-    max_tries=5,
-    max_time=300
-)
-async def connect_to_voice_channel(channel):
-    """Connect to voice channel with retry mechanism"""
-    try:
-        return await channel.connect()
-    except Exception as e:
-        logging.error(f"Failed to connect to voice channel: {e}", exc_info=True)
-        raise
-
-async def cleanup_local_backups(backup_dir='data_backup', keep_latest=5):
-    """
-    Clean up local backup files after successful MongoDB upload
-    Args:
-        backup_dir: Directory containing backup files
-        keep_latest: Number of most recent backups to keep
-    """
-    try:
-        # Get all backup files
-        voice_stats_files = glob.glob(os.path.join(backup_dir, 'voice_stats_*.json'))
-        co_occurrence_files = glob.glob(os.path.join(backup_dir, 'co_occurrence_stats_*.json'))
-        
-        # Sort files by modification time
-        voice_stats_files.sort(key=os.path.getmtime, reverse=True)
-        co_occurrence_files.sort(key=os.path.getmtime, reverse=True)
-        
-        # Keep only the latest N files
-        files_to_delete = voice_stats_files[keep_latest:] + co_occurrence_files[keep_latest:]
-        
-        # Delete old files
-        for file in files_to_delete:
-            try:
-                os.remove(file)
-                logging.info(f"Deleted old backup file: {file}")
-            except OSError as e:
-                logging.error(f"Error deleting file {file}: {e}")
-                
-    except Exception as e:
-        logging.error(f"Error during backup cleanup: {e}", exc_info=True)
-
-async def save_data_periodically():
-    """Periodically save data to MongoDB and local backup"""
-    while True:
-        try:
-            # Save voice stats
-            backup_path = os.path.join('data_backup', f'voice_stats_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
-            with open(backup_path, 'w', encoding='utf-8') as f:
-                json.dump(voice_stats, f, ensure_ascii=False, indent=2)
-            logging.info(f"已创建本地备份: {backup_path}")
-            
-            # Save to MongoDB
-            await save_voice_stats_to_mongodb()
-            logging.info("语音统计数据已保存到MongoDB。")
-            
-            # Save co-occurrence stats
-            backup_path = os.path.join('data_backup', f'co_occurrence_stats_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
-            with open(backup_path, 'w', encoding='utf-8') as f:
-                json.dump(co_occurrence_stats, f, ensure_ascii=False, indent=2)
-            logging.info(f"已创建本地备份: {backup_path}")
-            
-            # Save to MongoDB
-            await save_co_occurrence_stats_to_mongodb()
-            logging.info("共同在线统计数据已保存。")
-            
-            # Cleanup old backups
-            await cleanup_local_backups()
-            
-            await asyncio.sleep(60)  # Save every minute
-            
-        except Exception as e:
-            logging.error(f"Error saving data: {e}", exc_info=True)
-            await asyncio.sleep(10)  # Shorter delay on error
