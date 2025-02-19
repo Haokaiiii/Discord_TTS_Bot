@@ -1021,7 +1021,7 @@ bot.on_command_error = handle_command_error
 async def run_bot():
     await bot.start(os.getenv('DISCORD_TOKEN'))
 
-async def health_check():
+async def health_check(request):
     """Health check endpoint for Docker"""
     return web.Response(text="OK", status=200)
 

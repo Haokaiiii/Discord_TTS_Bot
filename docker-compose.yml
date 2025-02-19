@@ -1,8 +1,10 @@
 version: '3.8'
 
 services:
-  discord-bot:
-    build: .
+  disbot:
+    image: yourdockerhubusername/disbot:latest
+    # or if building locally:
+    # build: .
     restart: unless-stopped
     environment:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
