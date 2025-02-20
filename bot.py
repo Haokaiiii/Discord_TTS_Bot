@@ -491,6 +491,11 @@ async def handle_voice_event(guild, member, before, after, event_type):
     else:
         return
 
+    voice_client, error = await get_voice_client(guild.id, voice_channel)
+    if error:
+        await ctx.send(error)
+        return
+
     await queue_tts(guild, voice_channel, message)
 
 async def delayed_switch_broadcast(guild, member, voice_channel):
@@ -558,64 +563,22 @@ async def process_guild_tts_queue(guild_id):
         finally:
             guild_tts_queues[guild_id].task_done()
 
-async def ensure_voice_client_ready(guild, voice_channel, force_reconnect=False):
-    """
-    确保语音客户端处于可用状态
-    
-    Parameters:
-    - guild: Discord guild 对象
-    - voice_channel: 目标语音频道
-    - force_reconnect: 是否强制重新连接
-    
-    Returns:
-    - (voice_client, error_message)
-    """
+async def get_voice_client(guild_id, channel):
+    """获取或创建语音客户端，确保同一服务器只有一个活跃连接"""
     try:
-        voice_client = guild_voice_clients.get(guild.id)
+        # 如果已存在连接，先清理
+        if guild_id in guild_voice_clients:
+            await cleanup_voice_client(guild_id)
         
-        # 检查是否需要重新连接
-        needs_reconnect = (
-            force_reconnect or
-            not voice_client or
-            not voice_client.is_connected() or
-            voice_client.channel != voice_channel or
-            getattr(voice_client, 'last_success', 0) < time.time() - 300  # 5分钟无活动视为超时
-        )
+        # 创建新连接
+        voice_client = await channel.connect()
+        voice_client.last_success = time.time()
+        voice_client.failed_attempts = 0
+        guild_voice_clients[guild_id] = voice_client
+        return voice_client, None
         
-        if needs_reconnect:
-            # 如果已有连接，先断开
-            if voice_client and voice_client.is_connected():
-                try:
-                    await voice_client.disconnect(force=True)
-                except Exception as e:
-                    logging.warning(f"断开旧语音连接时发生错误: {e}")
-                
-            # 尝试建立新连接
-            try:
-                voice_client = await voice_channel.connect(timeout=20.0)
-                guild_voice_clients[guild.id] = voice_client
-                
-                # 设置自定义属性用于追踪连接状态
-                voice_client.last_success = time.time()
-                voice_client.failed_attempts = 0
-                
-                logging.info(f"成功连接到语音频道: '{voice_channel.name}'")
-                return voice_client, None
-                
-            except Exception as e:
-                error_msg = f"连接到语音频道失败: {str(e)}"
-                logging.error(error_msg)
-                return None, error_msg
-        
-        # 验证现有连接的状态
-        if voice_client.is_connected():
-            voice_client.last_success = time.time()  # 更新最后成功时间
-            return voice_client, None
-        else:
-            return None, "语音客户端状态异常"
-            
     except Exception as e:
-        error_msg = f"确保语音客户端就绪时发生错误: {str(e)}"
+        error_msg = f"连接到语音频道失败: {str(e)}"
         logging.error(error_msg)
         return None, error_msg
 
@@ -631,11 +594,7 @@ async def handle_tts_task(task):
     for attempt in range(max_retries):
         try:
             # 确保语音客户端就绪
-            voice_client, error = await ensure_voice_client_ready(
-                guild, 
-                voice_channel,
-                force_reconnect=(attempt > 0)  # 重试时强制重新连接
-            )
+            voice_client, error = await get_voice_client(guild.id, voice_channel)
             
             if error:
                 if attempt == max_retries - 1:
@@ -1381,6 +1340,7 @@ async def check_voice_connections():
     for guild_id, voice_client in list(guild_voice_clients.items()):
         try:
             if not voice_client or not voice_client.is_connected():
+                await cleanup_voice_client(guild_id)
                 continue
                 
             # 检查最后成功时间
@@ -1390,15 +1350,23 @@ async def check_voice_connections():
             # 如果超过5分钟没有成功操作，或失败次数过多，强制重新连接
             if (time.time() - last_success > 300) or (failed_attempts > 3):
                 logging.warning(f"检测到可能的语音连接问题，正在重新连接... Guild ID: {guild_id}")
-                try:
-                    await voice_client.disconnect(force=True)
-                except Exception as e:
-                    logging.error(f"断开问题连接时发生错误: {e}")
-                finally:
-                    guild_voice_clients.pop(guild_id, None)
+                await cleanup_voice_client(guild_id)
                     
         except Exception as e:
             logging.error(f"检查语音连接状态时发生错误 (Guild ID: {guild_id}): {e}")
+            await cleanup_voice_client(guild_id)
+
+async def cleanup_voice_client(guild_id):
+    """清理指定服务器的语音客户端连接"""
+    try:
+        if guild_id in guild_voice_clients:
+            voice_client = guild_voice_clients[guild_id]
+            if voice_client and voice_client.is_connected():
+                await voice_client.disconnect(force=True)
+            guild_voice_clients.pop(guild_id, None)
+            logging.info(f"已清理服务器 {guild_id} 的语音连接")
+    except Exception as e:
+        logging.error(f"清理语音连接时发生错误 (Guild ID: {guild_id}): {e}")
 
 async def main():
     try:
