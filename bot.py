@@ -285,6 +285,7 @@ async def on_ready():
     schedule_reports()
     save_stats.start()
     cleanup_tts_files.start()
+    check_voice_connections.start()
     logging.info("定期保存数据、报告和清理任务已启动。")
 
 def get_preferred_name(member):
@@ -557,142 +558,133 @@ async def process_guild_tts_queue(guild_id):
         finally:
             guild_tts_queues[guild_id].task_done()
 
-async def ensure_voice_connected(voice_client, voice_channel, max_tries=15, initial_delay=3.0):
-    """Example helper for re-connecting to a voice channel if needed"""
-    delay = initial_delay
-    for i in range(max_tries):
-        try:
-            if voice_client and voice_client.is_connected() and voice_client.channel == voice_channel:
-                logging.info(f"成功连接到语音频道: '{voice_channel.name}'")
-                return True
-            if voice_client:
+async def ensure_voice_client_ready(guild, voice_channel, force_reconnect=False):
+    """
+    确保语音客户端处于可用状态
+    
+    Parameters:
+    - guild: Discord guild 对象
+    - voice_channel: 目标语音频道
+    - force_reconnect: 是否强制重新连接
+    
+    Returns:
+    - (voice_client, error_message)
+    """
+    try:
+        voice_client = guild_voice_clients.get(guild.id)
+        
+        # 检查是否需要重新连接
+        needs_reconnect = (
+            force_reconnect or
+            not voice_client or
+            not voice_client.is_connected() or
+            voice_client.channel != voice_channel or
+            getattr(voice_client, 'last_success', 0) < time.time() - 300  # 5分钟无活动视为超时
+        )
+        
+        if needs_reconnect:
+            # 如果已有连接，先断开
+            if voice_client and voice_client.is_connected():
                 try:
                     await voice_client.disconnect(force=True)
-                    logging.info("旧的语音客户端已断开。")
                 except Exception as e:
-                    logging.warning(f"断开旧语音客户端时发生错误: {e}")
-
-            logging.info(f"尝试第 {i+1} 次连接到语音频道: '{voice_channel.name}'")
-            voice_client = await voice_channel.connect()
-            guild_voice_clients[voice_channel.guild.id] = voice_client
-
-            if voice_client and voice_client.is_connected() and voice_client.channel == voice_channel:
+                    logging.warning(f"断开旧语音连接时发生错误: {e}")
+                
+            # 尝试建立新连接
+            try:
+                voice_client = await voice_channel.connect(timeout=20.0)
+                guild_voice_clients[guild.id] = voice_client
+                
+                # 设置自定义属性用于追踪连接状态
+                voice_client.last_success = time.time()
+                voice_client.failed_attempts = 0
+                
                 logging.info(f"成功连接到语音频道: '{voice_channel.name}'")
-                return True
-        except discord.errors.Forbidden:
-            logging.error("机器人缺少连接到语音频道的权限。")
-            return False
-        except discord.errors.HTTPException as e:
-            logging.error(f"连接到语音频道时发生 HTTP 异常: {e}")
-        except Exception as e:
-            logging.error(f"连接到语音频道时发生异常: {e}")
-
-        logging.info(f"等待 {delay} 秒后重试连接。")
-        await asyncio.sleep(delay)
-        delay *= 2
-
-    logging.warning(f"在 {max_tries} 次尝试后仍未能连接到语音频道: '{voice_channel.name}'")
-    return False
+                return voice_client, None
+                
+            except Exception as e:
+                error_msg = f"连接到语音频道失败: {str(e)}"
+                logging.error(error_msg)
+                return None, error_msg
+        
+        # 验证现有连接的状态
+        if voice_client.is_connected():
+            voice_client.last_success = time.time()  # 更新最后成功时间
+            return voice_client, None
+        else:
+            return None, "语音客户端状态异常"
+            
+    except Exception as e:
+        error_msg = f"确保语音客户端就绪时发生错误: {str(e)}"
+        logging.error(error_msg)
+        return None, error_msg
 
 async def handle_tts_task(task):
+    """处理 TTS 任务，包含重试机制和错误恢复"""
     guild = task['guild']
     voice_channel = task['voice_channel']
     message_content = task['message']
     tts_path = task['tts_path']
+    max_retries = 3
+    retry_delay = 2.0
 
-    # 寻找可以发送文本的频道
-    text_channel = guild.system_channel
-    if not text_channel or not has_required_permissions(text_channel):
-        for channel in guild.text_channels:
-            if has_required_permissions(channel):
-                text_channel = channel
-                break
-
-    if not text_channel:
-        logging.warning(f"在服务器 '{guild.name}' 中未找到可发送消息的文本频道。")
-        return
-
-    # 先发送文本消息 (可选删除机制)
-    try:
-        await text_channel.send(message_content, delete_after=5)
-        logging.info(f"已发送文本消息: '{message_content}' (5秒后删除)")
-    except Exception as e:
-        logging.error(f"发送文本消息失败: {e}")
-        return
-
-    # 获取或创建 voice_client
-    voice_client = guild_voice_clients.get(guild.id)
-
-    # 如果 voice_client 不存在或已断开，则直接 connect()
-    if not voice_client or not voice_client.is_connected():
+    for attempt in range(max_retries):
         try:
-            voice_client = await voice_channel.connect()
-            guild_voice_clients[guild.id] = voice_client
-            logging.info(f"已连接到语音频道: '{voice_channel.name}'")
-        except discord.ClientException as e:
-            if "Already connected to a voice channel" in str(e):
-                logging.error("已经连接到其他语音频道，尝试断开并重连...")
-                try:
-                    if voice_client and voice_client.is_connected():
-                        await voice_client.disconnect(force=True)
-                    voice_client = await voice_channel.connect()
-                    guild_voice_clients[guild.id] = voice_client
-                except Exception as reconnect_err:
-                    logging.error(f"强制断开并重连失败: {reconnect_err}")
+            # 确保语音客户端就绪
+            voice_client, error = await ensure_voice_client_ready(
+                guild, 
+                voice_channel,
+                force_reconnect=(attempt > 0)  # 重试时强制重新连接
+            )
+            
+            if error:
+                if attempt == max_retries - 1:
+                    logging.error(f"在 {max_retries} 次尝试后仍未能建立语音连接")
                     return
-            else:
-                logging.error(f"无法连接到语音频道，出现其他ClientException: {e}")
+                await asyncio.sleep(retry_delay * (attempt + 1))
+                continue
+                
+            # 检查音频文件
+            if not os.path.exists(tts_path):
+                logging.error(f"TTS 文件不存在: {tts_path}")
                 return
-        except Exception as e:
-            logging.error(f"无法连接到语音频道: {e}")
-            return
-    else:
-        # 如果已有 voice_client 并且连接中，但频道不同，则尝试 move_to
-        if voice_client.channel != voice_channel:
-            try:
-                await voice_client.move_to(voice_channel)
-                logging.info(f"已移动到语音频道: '{voice_channel.name}'")
-            except discord.ClientException as e:
-                if "Already connected to a voice channel" in str(e):
-                    logging.error("移动到语音频道失败: Already connected. 尝试强制断开并重连.")
-                    try:
-                        await voice_client.disconnect(force=True)
-                        voice_client = await voice_channel.connect()
-                        guild_voice_clients[guild.id] = voice_client
-                    except Exception as reconnect_err:
-                        logging.error(f"重连到语音频道失败: {reconnect_err}")
-                        return
+                
+            # 创建音频源
+            audio_source = discord.FFmpegPCMAudio(
+                tts_path,
+                executable=FFMPEG_EXECUTABLE,
+                options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+            )
+            
+            # 添加音量转换
+            audio_source = discord.PCMVolumeTransformer(audio_source, volume=1.0)
+            
+            # 播放音频
+            def after_play(error):
+                if error:
+                    logging.error(f"播放完成时发生错误: {error}")
                 else:
-                    logging.error(f"移动到语音频道失败: {e}")
-                    return
-            except Exception as move_err:
-                logging.error(f"移动到语音频道时发生错误: {move_err}")
+                    voice_client.last_success = time.time()
+                    voice_client.failed_attempts = 0
+
+            if not voice_client.is_playing():
+                voice_client.play(audio_source, after=after_play)
+                
+                # 等待播放完成
+                while voice_client.is_playing():
+                    await asyncio.sleep(0.1)
                 return
-
-    # 检查 TTS 文件
-    if not os.path.exists(tts_path) or os.path.getsize(tts_path) == 0:
-        logging.error(f"TTS 文件无效或为空: {tts_path}")
-        return
-
-    # 播放逻辑
-    try:
-        audio_source = discord.FFmpegPCMAudio(tts_path, executable=FFMPEG_EXECUTABLE)
-        if not voice_client.is_playing():
-            voice_client.play(audio_source)
-            logging.info(f"开始播放音频: {tts_path}")
-        else:
-            # 如果当前正在播放，等它播完
-            while voice_client.is_playing():
-                await asyncio.sleep(0.5)
-            voice_client.play(audio_source)
-            logging.info(f"开始播放音频: {tts_path}")
-    except Exception as e:
-        logging.error(f"播放音频失败: {e}")
-        return
-
-    # 等待播放结束
-    while voice_client.is_playing():
-        await asyncio.sleep(0.1)
+                
+        except Exception as e:
+            logging.error(f"处理 TTS 任务时发生错误 (尝试 {attempt + 1}/{max_retries}): {e}")
+            if voice_client:
+                voice_client.failed_attempts = getattr(voice_client, 'failed_attempts', 0) + 1
+            
+            if attempt == max_retries - 1:
+                logging.error(f"在 {max_retries} 次尝试后放弃 TTS 任务")
+                return
+                
+            await asyncio.sleep(retry_delay * (attempt + 1))
 
 # ---------------- Bot 命令 ----------------
 @bot.command()
@@ -1355,6 +1347,31 @@ async def start_health_server():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', 8080)
     await site.start()
+
+@tasks.loop(minutes=2)
+async def check_voice_connections():
+    """定期检查所有语音连接的状态"""
+    for guild_id, voice_client in list(guild_voice_clients.items()):
+        try:
+            if not voice_client or not voice_client.is_connected():
+                continue
+                
+            # 检查最后成功时间
+            last_success = getattr(voice_client, 'last_success', 0)
+            failed_attempts = getattr(voice_client, 'failed_attempts', 0)
+            
+            # 如果超过5分钟没有成功操作，或失败次数过多，强制重新连接
+            if (time.time() - last_success > 300) or (failed_attempts > 3):
+                logging.warning(f"检测到可能的语音连接问题，正在重新连接... Guild ID: {guild_id}")
+                try:
+                    await voice_client.disconnect(force=True)
+                except Exception as e:
+                    logging.error(f"断开问题连接时发生错误: {e}")
+                finally:
+                    guild_voice_clients.pop(guild_id, None)
+                    
+        except Exception as e:
+            logging.error(f"检查语音连接状态时发生错误 (Guild ID: {guild_id}): {e}")
 
 async def main():
     try:
