@@ -65,7 +65,8 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 guild_voice_clients = {}
 guild_tts_queues = {}
 guild_tts_tasks = {}
-
+# 在全局变量区域（比如在 line 69 附近）添加：
+ALLOWED_COMMAND_CHANNEL_ID = 555240012460064771
 EXCLUDED_VOICE_CHANNEL_IDS = set()
 
 executor = ThreadPoolExecutor(max_workers=8)
@@ -300,7 +301,13 @@ def get_preferred_name(member):
     else:
         return member.name
 
+def check_channel():
+    async def predicate(ctx):
+        return ctx.channel.id == ALLOWED_COMMAND_CHANNEL_ID
+    return commands.check(predicate)
+
 @bot.command()
+@check_channel()
 async def check_nickname(ctx, member: discord.Member = None):
     """检查指定成员的昵称信息"""
     if member is None:
@@ -689,6 +696,7 @@ async def handle_tts_task(task):
 
 # ---------------- Bot 命令 ----------------
 @bot.command()
+@check_channel()
 async def leave(ctx):
     """让机器人离开当前语音频道"""
     guild = ctx.guild
@@ -705,6 +713,7 @@ async def leave(ctx):
         await ctx.send("机器人当前不在任何语音频道。", delete_after=5)
 
 @bot.command()
+@check_channel()
 async def test_delete(ctx):
     """测试消息删除功能"""
     try:
@@ -713,6 +722,7 @@ async def test_delete(ctx):
         await ctx.send(f"删除失败: {e}", delete_after=5)
 
 @bot.command()
+@check_channel()
 async def play_test(ctx):
     """播放测试音频"""
     guild = ctx.guild
@@ -755,6 +765,7 @@ async def play_test(ctx):
 # 生成共同在线热图 (绝对时长)
 # -------------------------------------------------------------------
 @bot.command()
+@check_channel()
 async def show_relationships(ctx):
     """Show a heatmap of how often users are in voice channels together (绝对时长)"""
     try:
@@ -771,7 +782,7 @@ async def show_relationships(ctx):
 async def generate_co_occurrence_heatmap(guild_id):
     """Generate a heatmap showing how often users are in voice channels together,
        只考虑总时长排名前30 + daily前20 + 最近加入者。
-       并且最终对坐标轴按照“总时长”从大到小进行排序。
+       并且最终对坐标轴按照"总时长"从大到小进行排序。
     """
     try:
         # 1) 获取共同在线统计
@@ -836,7 +847,7 @@ async def generate_co_occurrence_heatmap(guild_id):
             final_users.add(u2)
         final_users = list(final_users)
 
-        # **重点**: 按“总时长”从大到小排序
+        # **重点**: 按"总时长"从大到小排序
         final_users = sorted(
             final_users,
             key=lambda uid: guild_voice_stat[uid]['total'] if uid in guild_voice_stat else 0,
@@ -907,10 +918,11 @@ async def generate_co_occurrence_heatmap(guild_id):
 # 生成共同在线热图 (相对时长)
 # -------------------------------------------------------------------
 @bot.command()
+@check_channel()
 async def show_relationships_relative(ctx):
     """
     命令: !show_relationships_relative
-    生成基于“相对关系(%)”的共同语音热图，并发送图片。
+    生成基于"相对关系(%)"的共同语音热图，并发送图片。
     """
     try:
         buf, error = await generate_co_occurrence_heatmap_relative(ctx.guild.id)
@@ -925,9 +937,9 @@ async def show_relationships_relative(ctx):
 
 async def generate_co_occurrence_heatmap_relative(guild_id):
     """
-    生成显示“共同时长在双方最小总时长中的占比(%)”的热图(0%~100%)，
+    生成显示"共同时长在双方最小总时长中的占比(%)"的热图(0%~100%)，
     同样只考虑: 总时长排名前30 + daily排名前20 + 最近加入者，
-    最后按照“总时长”从大到小排序坐标轴。
+    最后按照"总时长"从大到小排序坐标轴。
     """
     try:
         # 1) 获取共同在线统计
@@ -990,7 +1002,7 @@ async def generate_co_occurrence_heatmap_relative(guild_id):
             final_users.add(u2)
         final_users = list(final_users)
 
-        # **按照“总时长”从大到小**排序
+        # **按照"总时长"从大到小**排序
         final_users = sorted(
             final_users,
             key=lambda uid: guild_voice_stat[uid]['total'] if uid in guild_voice_stat else 0,
@@ -1072,6 +1084,7 @@ async def generate_co_occurrence_heatmap_relative(guild_id):
 
 
 @bot.command()
+@check_channel()
 async def stats(ctx, period: str):
     """
     实时查看指定周期的语音统计数据，period 可为 daily, weekly, monthly, yearly
@@ -1237,93 +1250,24 @@ async def generate_periodic_chart(guild, period):
         member = guild.get_member(member_id)
         if member:
             members.append(get_preferred_name(member))
-            durations.append(data[period] / 3600)
+            durations.append(data[period] / 3600.0)
 
     if not members:
         logging.info(f"没有成员数据可用于生成 {period} 报告在服务器 '{guild.name}'。")
         return
 
-
-
-    plt.figure(figsize=(12, 8))
-    sns.barplot(x=durations, y=members, palette="viridis", edgecolor='black')
-
-
-
-
-    plt.xlabel('语音时长 (小时)', fontsize=14)
-    plt.ylabel('成员', fontsize=14)
-    plt.title(title, fontsize=16)
-
-
-
-
-
-
-
-
-
-
-
-
-    plt.tight_layout()
-
-    image_path = os.path.join(TTS_CACHE_DIR, f"{period}_report_{guild_id}.png")
-    plt.savefig(image_path, dpi=300)
-    plt.close()
-
-    text_channel = guild.system_channel
-    if not text_channel or not has_required_permissions(text_channel):
-        for channel in guild.text_channels:
-            if has_required_permissions(channel):
-                text_channel = channel
-                break
-    if text_channel:
-        try:
-            with open(image_path, 'rb') as f:
-                picture = discord.File(f)
-                await text_channel.send(file=picture)
-            os.remove(image_path)
-            logging.info(f"已发送 {period} 排行榜图片到服务器 '{guild.name}'。")
-        except Exception as e:
-            logging.error(f"发送 {period} 排行榜图片失败: {e}")
+    # 重置并应用与 heatmap 相同的字体设置
+    font_path = '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc'
+    if os.path.exists(font_path):
+        font_prop = fm.FontProperties(fname=font_path)
+        plt.rcParams['font.sans-serif'] = [font_prop.get_name()]
+        plt.rcParams['font.family'] = 'sans-serif'
+        plt.rcParams['axes.unicode_minus'] = False
+        sns.set_theme(style="whitegrid", font=font_prop.get_name(), context="talk")
     else:
-        logging.warning(f"在服务器 '{guild.name}' 中未找到可发送消息的文本频道。")
+        logging.warning(f"字体文件 {font_path} 不存在。将使用默认字体。")
+        sns.set_theme(style="whitegrid", context="talk")
 
-async def generate_periodic_chart(guild, period):
-    """
-    生成指定 period 的排行榜柱状图并发送到文本频道。
-    """
-    guild_id = guild.id
-    if guild_id not in voice_stats:
-        return
-    members_stats = voice_stats[guild_id]
-    if not members_stats:
-        return
-
-    title_map = {
-        'daily': '每日语音时长排行榜',
-        'weekly': '每周语音时长排行榜',
-        'monthly': '每月语音时长排行榜',
-        'yearly': '年度语音时长排行榜'
-    }
-    title = title_map.get(period, f"{period.capitalize()}排行榜")
-
-    sorted_members = sorted(members_stats.items(), key=lambda x: x[1][period], reverse=True)[:10]
-
-    members = []
-    durations = []
-    for member_id, data in sorted_members:
-        member = guild.get_member(member_id)
-        if member:
-            members.append(get_preferred_name(member))
-            durations.append(data[period] / 3600.0)
-
-    if not members:
-        return
-
-    # 设置更好看的主题和大小
-    sns.set_theme(style="whitegrid", context="talk")
     plt.figure(figsize=(12, 8))
 
     # 自定义调色板
@@ -1348,7 +1292,7 @@ async def generate_periodic_chart(guild, period):
     plt.tight_layout()
 
     image_path = os.path.join(TTS_CACHE_DIR, f"{period}_report_{guild_id}.png")
-    plt.savefig(image_path, dpi=300)
+    plt.savefig(image_path, dpi=300, bbox_inches='tight')
     plt.close()
 
     text_channel = guild.system_channel
@@ -1375,6 +1319,11 @@ class BotException(Exception):
 
 async def handle_command_error(ctx, error):
     """Global error handler for commands"""
+    if isinstance(error, commands.CheckFailure):
+        # 可以选择不做任何响应，或者只在允许的频道发送错误消息
+        if ctx.channel.id == ALLOWED_COMMAND_CHANNEL_ID:
+            await ctx.send("此命令只能在指定的频道中使用。")
+        return
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("You don't have permission to use this command.")
     elif isinstance(error, commands.BotMissingPermissions):
