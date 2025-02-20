@@ -1166,7 +1166,11 @@ def schedule_reports():
 async def generate_report(period, ctx_guild=None):
     """
     生成指定 period 的排行榜报告并发送到文本频道。
-    如果 ctx_guild 不为空，则只针对这个 Guild；如果为空，则对所有 Bot 所在的服务器生成周期性报告。
+    包含:
+    1. 文字排行榜
+    2. 柱状图可视化
+    3. 绝对共同在线时长热图
+    4. 相对共同在线时长热图
     """
     guilds = [ctx_guild] if ctx_guild else bot.guilds
     for guild in guilds:
@@ -1179,6 +1183,7 @@ async def generate_report(period, ctx_guild=None):
         if not members_stats:
             continue
 
+        # 1. 生成并发送文字排行榜
         sorted_members = sorted(members_stats.items(), key=lambda x: x[1][period], reverse=True)[:10]
         if not sorted_members:
             continue
@@ -1193,6 +1198,7 @@ async def generate_report(period, ctx_guild=None):
                 minutes, secs = divmod(remainder, 60)
                 report += f"{rank}. {name}: {hours}h {minutes}m {secs}s\n"
 
+        # 找到合适的文本频道发送消息
         text_channel = guild.system_channel
         if not text_channel or not has_required_permissions(text_channel):
             for channel in guild.text_channels:
@@ -1203,15 +1209,36 @@ async def generate_report(period, ctx_guild=None):
 
         if text_channel:
             try:
+                # 发送文字排行榜
                 await text_channel.send(report)
-                logging.info(f"已发送 {period} 汇报到服务器 '{guild.name}'。")
+                logging.info(f"已发送 {period} 文字汇报到服务器 '{guild.name}'。")
+
+                # 2. 生成并发送柱状图
                 await generate_periodic_chart(guild, period)
-                # 如果是自动任务（ctx_guild is None），发送完后清零对应周期的统计数据
+                
+                # 3. 生成并发送绝对时长热图
+                buf, error = await generate_co_occurrence_heatmap(guild_id)
+                if error:
+                    logging.error(f"生成绝对时长热图失败: {error}")
+                else:
+                    file = discord.File(buf, filename='relationships.png')
+                    await text_channel.send("**共同在线时长热图 (小时)**", file=file)
+
+                # 4. 生成并发送相对时长热图
+                buf, error = await generate_co_occurrence_heatmap_relative(guild_id)
+                if error:
+                    logging.error(f"生成相对时长热图失败: {error}")
+                else:
+                    file = discord.File(buf, filename='relative_relationships.png')
+                    await text_channel.send("**共同在线时长热图 (百分比)**", file=file)
+
+                # 如果是自动任务（ctx_guild is None），清零对应周期的统计数据
                 if ctx_guild is None:
                     for member_id in voice_stats[guild_id]:
                         voice_stats[guild_id][member_id][period] = 0
+
             except Exception as e:
-                logging.error(f"发送 {period} 汇报到服务器 '{guild.name}' 失败: {e}")
+                logging.error(f"发送 {period} 完整报告到服务器 '{guild.name}' 失败: {e}")
         else:
             logging.warning(f"在服务器 '{guild.name}' 中未找到可发送消息的文本频道。")
 
