@@ -571,34 +571,58 @@ async def process_guild_tts_queue(guild_id):
         finally:
             guild_tts_queues[guild_id].task_done()
 
-async def get_voice_client(guild_id, channel):
+
+# ------------------ 关键改动：在这里替换 get_voice_client ------------------
+async def get_voice_client(guild_id: int, channel: discord.VoiceChannel):
     """
-    Connect to the voice channel if not already in that channel.
-    Prevents repeated "Already connected" errors.
+    获取或建立给定 guild 对应的语音连接。
+    如果已连接到不同频道，会先断开旧连接；
+    如果在尝试连接时遇到 "Already connected to a voice channel"，
+    就立即执行强制清理并重试一次。
     """
     async with voice_connection_lock:
         voice_client = guild_voice_clients.get(guild_id)
 
-        # If we're already connected to the same channel, reuse that connection
+        # (1) 如果已经连接并且就在同一个频道，直接复用
         if voice_client and voice_client.is_connected():
             current_channel = voice_client.channel
             if current_channel and current_channel.id == channel.id:
-                return voice_client  # Already in correct channel
+                return voice_client
 
-        # Otherwise, disconnect from any old channel first
+        # (2) 如果 voice_client 存在但频道不同，则先断开
         if voice_client:
             await cleanup_voice_client(guild_id)
             await asyncio.sleep(1.0)
 
+        # (3) 第一次尝试连接
         try:
             new_vc = await channel.connect()
             new_vc.last_success = time.time()
             new_vc.failed_attempts = 0
             guild_voice_clients[guild_id] = new_vc
             return new_vc
+
         except Exception as e:
-            logging.error(f"连接到语音频道失败: {str(e)}")
-            return None
+            # (4) 如果是 "Already connected"，则立刻退频道再连一次
+            if "Already connected to a voice channel" in str(e):
+                logging.warning("检测到 'Already connected' 异常，尝试强制退频道后再连一次...")
+                await cleanup_voice_client(guild_id)
+                await asyncio.sleep(2.0)
+
+                try:
+                    new_vc = await channel.connect()
+                    new_vc.last_success = time.time()
+                    new_vc.failed_attempts = 0
+                    guild_voice_clients[guild_id] = new_vc
+                    return new_vc
+                except Exception as e2:
+                    logging.error(f"二次重试仍然连接失败: {e2}")
+                    return None
+            else:
+                # 其他错误也记录
+                logging.error(f"连接到语音频道失败: {e}")
+                return None
+
 
 async def handle_tts_task(task):
     """处理 TTS 任务，包含重试机制和错误恢复"""
@@ -970,7 +994,7 @@ async def generate_co_occurrence_heatmap_relative(guild_id):
                 ratio_percent = 0.0
             else:
                 ratio_percent = (co_hours / denominator) * 100.0
-                # Clip at 100% in case of rounding
+                # Clip在100以内，防止数值浮动
                 if ratio_percent > 100:
                     ratio_percent = 100
             matrix[i][j] = ratio_percent
@@ -1334,8 +1358,12 @@ async def check_voice_connections():
             logging.error(f"检查语音连接状态时发生错误 (Guild ID: {guild_id}): {e}")
             await cleanup_voice_client(guild_id)
 
-async def cleanup_voice_client(guild_id):
-    """清理指定服务器的语音客户端连接"""
+async def cleanup_voice_client(guild_id: int):
+    """
+    强制清理指定 guild 的语音连接：
+    - 断开真正的 Discord 连接
+    - 从 guild_voice_clients 中删除
+    """
     try:
         if guild_id in guild_voice_clients:
             voice_client = guild_voice_clients[guild_id]
