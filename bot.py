@@ -1,5 +1,3 @@
-# bot.py
-
 import os
 import discord
 from discord.ext import commands, tasks
@@ -462,6 +460,7 @@ async def on_voice_state_update(member, before, after):
 
 
 async def handle_voice_event(guild, member, before, after, event_type):
+    """Handles join/leave/switch events and queues TTS messages."""
     try:
         # 获取最新的成员信息
         member = await guild.fetch_member(member.id)
@@ -474,7 +473,7 @@ async def handle_voice_event(guild, member, before, after, event_type):
         return
 
     if event_type == 'switch':
-        # 切频道要去做"延迟"判断
+        # 切频道要做 "延迟" 判断
         key = (guild.id, member.id)
         old_task = pending_switch_tasks.get(key)
         if old_task and not old_task.done():
@@ -495,14 +494,15 @@ async def handle_voice_event(guild, member, before, after, event_type):
 
     voice_client = await get_voice_client(guild.id, voice_channel)
     if not voice_client:
-        # 如果获取/重连失败，这里只记录日志，避免中断
-        logging.error(f"获取或连接语音频道失败，Guild={guild.id}, Channel={voice_channel.id}")
+        logging.error(
+            f"获取或连接语音频道失败，Guild={guild.id}, Channel={voice_channel.id}"
+        )
         return
 
     await queue_tts(guild, voice_channel, message)
 
 async def delayed_switch_broadcast(guild, member, voice_channel):
-    """ 延迟 DEBOUNCE_TIME 秒后，如果此任务没被取消，则执行 '叛变' TTS。 """
+    """延迟 DEBOUNCE_TIME 秒后，如果此任务没被取消，则执行“叛变了”TTS。"""
     try:
         await asyncio.sleep(DEBOUNCE_TIME)
     except asyncio.CancelledError:
@@ -512,7 +512,9 @@ async def delayed_switch_broadcast(guild, member, voice_channel):
     message = f"{get_preferred_name(member)} 叛变了！"
     voice_client = await get_voice_client(guild.id, voice_channel)
     if not voice_client:
-        logging.error(f"获取或连接语音频道失败 (switch)，Guild={guild.id}, Channel={voice_channel.id}")
+        logging.error(
+            f"获取或连接语音频道失败 (switch)，Guild={guild.id}, Channel={voice_channel.id}"
+        )
         return
 
     await queue_tts(guild, voice_channel, message)
@@ -571,22 +573,29 @@ async def process_guild_tts_queue(guild_id):
 
 async def get_voice_client(guild_id, channel):
     """
-    确保先断开旧连接，再连接到新的频道。
-    加了一个全局锁 voice_connection_lock，避免并发地试图连接/断开。
+    Connect to the voice channel if not already in that channel.
+    Prevents repeated "Already connected" errors.
     """
     async with voice_connection_lock:
-        try:
-            # 如果已存在连接，先清理
-            if guild_id in guild_voice_clients:
-                await cleanup_voice_client(guild_id)
-                # 给服务器一点时间同步断开状态
-                await asyncio.sleep(1.0)
+        voice_client = guild_voice_clients.get(guild_id)
 
-            voice_client = await channel.connect()
-            voice_client.last_success = time.time()
-            voice_client.failed_attempts = 0
-            guild_voice_clients[guild_id] = voice_client
-            return voice_client
+        # If we're already connected to the same channel, reuse that connection
+        if voice_client and voice_client.is_connected():
+            current_channel = voice_client.channel
+            if current_channel and current_channel.id == channel.id:
+                return voice_client  # Already in correct channel
+
+        # Otherwise, disconnect from any old channel first
+        if voice_client:
+            await cleanup_voice_client(guild_id)
+            await asyncio.sleep(1.0)
+
+        try:
+            new_vc = await channel.connect()
+            new_vc.last_success = time.time()
+            new_vc.failed_attempts = 0
+            guild_voice_clients[guild_id] = new_vc
+            return new_vc
         except Exception as e:
             logging.error(f"连接到语音频道失败: {str(e)}")
             return None
@@ -595,7 +604,6 @@ async def handle_tts_task(task):
     """处理 TTS 任务，包含重试机制和错误恢复"""
     guild = task['guild']
     voice_channel = task['voice_channel']
-    message_content = task['message']
     tts_path = task['tts_path']
     max_retries = 3
     retry_delay = 2.0
@@ -613,8 +621,7 @@ async def handle_tts_task(task):
             if not os.path.exists(tts_path):
                 logging.error(f"TTS 文件不存在: {tts_path}")
                 return
-                
-            # 创建音频源
+
             audio_source = discord.FFmpegPCMAudio(
                 tts_path,
                 executable=FFMPEG_EXECUTABLE,
@@ -636,7 +643,7 @@ async def handle_tts_task(task):
                     await asyncio.sleep(0.1)
                 return
 
-            # 如果已经在播放中，可以选择 sleep 再重试
+            # 如果已经在播放，可以选择 sleep 再重试
             await asyncio.sleep(1.0)
 
         except Exception as e:
@@ -963,6 +970,7 @@ async def generate_co_occurrence_heatmap_relative(guild_id):
                 ratio_percent = 0.0
             else:
                 ratio_percent = (co_hours / denominator) * 100.0
+                # Clip at 100% in case of rounding
                 if ratio_percent > 100:
                     ratio_percent = 100
             matrix[i][j] = ratio_percent
@@ -1270,7 +1278,6 @@ class BotException(Exception):
 async def handle_command_error(ctx, error):
     """Global error handler for commands"""
     if isinstance(error, commands.CheckFailure):
-        # 可以选择不做任何响应，或者只在允许的频道发送错误消息
         if ctx.channel.id == ALLOWED_COMMAND_CHANNEL_ID:
             await ctx.send("此命令只能在指定的频道中使用。")
         return
