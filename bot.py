@@ -63,7 +63,7 @@ guild_voice_clients = {}
 guild_tts_queues = {}
 guild_tts_tasks = {}
 
-ALLOWED_COMMAND_CHANNEL_ID = 555240012460064771
+ALLOWED_COMMAND_CHANNEL_ID = 1342752925533081630
 EXCLUDED_VOICE_CHANNEL_IDS = set()
 
 executor = ThreadPoolExecutor(max_workers=8)
