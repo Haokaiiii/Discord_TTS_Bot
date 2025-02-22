@@ -1436,7 +1436,7 @@ async def cleanup_voice_client(guild_id: int):
             logging.error(f"清理语音连接时发生错误 (Guild ID: {guild_id}): {e}")
 
     guild_voice_clients.pop(guild_id, None)
-    await asyncio.sleep(2.0)
+    await asyncio.sleep(5.0)
 
     # 二次检查
     still_vc = guild.voice_client
