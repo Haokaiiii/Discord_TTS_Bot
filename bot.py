@@ -506,7 +506,7 @@ async def handle_voice_event(guild, member, before, after, event_type):
     await queue_tts(guild, voice_channel, message)
 
 async def delayed_switch_broadcast(guild, member, voice_channel):
-    """延迟 DEBOUNCE_TIME 秒后，如果此任务没被取消，则执行“叛变了”TTS。"""
+    """延迟 DEBOUNCE_TIME 秒后，如果此任务没被取消，则执行"叛变了"TTS。"""
     try:
         await asyncio.sleep(DEBOUNCE_TIME)
     except asyncio.CancelledError:
@@ -678,18 +678,18 @@ async def get_voice_client(guild_id: int, channel: discord.VoiceChannel):
 
 
 async def handle_tts_task(task):
-    """处理 TTS 任务，包含重试机制和错误恢复"""
+    """处理 TTS 任务，包含重试机制和错误恢复，播放完30秒后自动退出"""
     guild = task['guild']
     voice_channel = task['voice_channel']
     tts_path = task['tts_path']
     max_retries = 3
     retry_delay = 2.0
+    AUTO_DISCONNECT_DELAY = 30  # 30秒后自动退出
 
     voice_client = guild_voice_clients.get(guild.id)
 
     for attempt in range(max_retries):
         try:
-            # 如果当前没有有效的 voice_client，就再试一次连接
             if not voice_client or not voice_client.is_connected():
                 voice_client = await get_voice_client(guild.id, voice_channel)
                 if not voice_client:
@@ -712,6 +712,8 @@ async def handle_tts_task(task):
                 else:
                     voice_client.last_success = time.time()
                     voice_client.failed_attempts = 0
+                    # 创建异步任务来处理延迟断开
+                    asyncio.create_task(delayed_disconnect(guild.id))
 
             if not voice_client.is_playing():
                 voice_client.play(audio_source, after=after_play)
@@ -720,7 +722,6 @@ async def handle_tts_task(task):
                     await asyncio.sleep(0.1)
                 return
 
-            # 如果已经在播放，可以选择 sleep 再重试
             await asyncio.sleep(1.0)
 
         except Exception as e:
@@ -733,6 +734,19 @@ async def handle_tts_task(task):
                 return
                 
             await asyncio.sleep(retry_delay * (attempt + 1))
+
+async def delayed_disconnect(guild_id: int):
+    """30秒后断开语音连接"""
+    await asyncio.sleep(30)  # 等待30秒
+    voice_client = guild_voice_clients.get(guild_id)
+    
+    if voice_client and voice_client.is_connected():
+        try:
+            if not voice_client.is_playing():  # 确保没有在播放其他内容
+                await cleanup_voice_client(guild_id)
+                logging.info(f"已自动断开与服务器 {guild_id} 的语音连接")
+        except Exception as e:
+            logging.error(f"自动断开语音连接时发生错误: {e}")
 
 @bot.command()
 @check_channel()
