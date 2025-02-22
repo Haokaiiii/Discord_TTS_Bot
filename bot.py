@@ -694,13 +694,12 @@ async def get_voice_client(guild_id: int, channel: discord.VoiceChannel):
 
 
 async def handle_tts_task(task):
-    """处理 TTS 任务，包含重试机制和错误恢复，播放完30秒后自动退出"""
+    """处理 TTS 任务，包含重试机制和错误恢复"""
     guild = task['guild']
     voice_channel = task['voice_channel']
     tts_path = task['tts_path']
     max_retries = 3
     retry_delay = 2.0
-    AUTO_DISCONNECT_DELAY = 30  # 30秒后自动退出
 
     voice_client = guild_voice_clients.get(guild.id)
 
@@ -723,7 +722,7 @@ async def handle_tts_task(task):
             audio_source = discord.PCMVolumeTransformer(audio_source, volume=1.0)
 
             # 创建一个 Future 对象来跟踪播放完成
-            play_future = asyncio.Future()
+            play_finished = asyncio.Future()
 
             def after_play(error):
                 if error:
@@ -731,18 +730,15 @@ async def handle_tts_task(task):
                 else:
                     voice_client.last_success = time.time()
                     voice_client.failed_attempts = 0
-                    # 创建一个新的事件循环来处理异步操作
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    try:
-                        loop.run_until_complete(delayed_disconnect(guild.id))
-                    finally:
-                        loop.close()
+                # 直接设置 Future 的结果
+                bot.loop.call_soon_threadsafe(lambda: play_finished.set_result(True))
 
             if not voice_client.is_playing():
                 voice_client.play(audio_source, after=after_play)
                 # 等待播放完成
-                await play_future
+                await play_finished
+                # 创建延迟断开的任务
+                bot.loop.create_task(delayed_disconnect(guild.id))
                 return
 
             await asyncio.sleep(1.0)
