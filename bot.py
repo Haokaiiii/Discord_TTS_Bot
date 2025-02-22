@@ -107,6 +107,8 @@ os.makedirs(BACKUP_DIR, exist_ok=True)
 # 用于防止并发重连的标记
 reconnecting_guilds = set()
 
+command_channel = None  # 用于存储命令频道的引用
+
 def save_local_backup(data, filename):
     """保存数据到本地备份文件"""
     backup_path = os.path.join(BACKUP_DIR, filename)
@@ -256,8 +258,22 @@ async def on_member_update(before, after):
 
 @bot.event
 async def on_ready():
+    global command_channel
     logging.info(f'已登录为 {bot.user}')
     logging.info(f"当前已加载命令: {[cmd.name for cmd in bot.commands]}")
+
+    # 初始化命令频道
+    for guild in bot.guilds:
+        channel = guild.get_channel(ALLOWED_COMMAND_CHANNEL_ID)
+        if channel:
+            command_channel = channel  # 正确设置命令频道
+            logging.info(f"已找到并设置命令频道: {channel.name}")
+            break
+
+    if not command_channel:
+        logging.error("未找到命令频道，请检查 ALLOWED_COMMAND_CHANNEL_ID 是否正确设置。")
+        return
+
     load_voice_stats()
     load_co_occurrence_stats()
     
@@ -321,7 +337,7 @@ async def check_nickname(ctx, member: discord.Member = None):
     if member is None:
         member = ctx.author
     name = get_preferred_name(member)
-    await ctx.send(f"成员 {member.id} 的首选名称: {name}")
+    await send_to_command_channel(ctx.guild, content=f"成员 {member.id} 的首选名称: {name}")
     logging.info(f"检查成员: ID={member.id}, Username={member.name}, Nickname={member.nick}, DisplayName={member.display_name}")
 
 @bot.event
@@ -712,17 +728,21 @@ async def handle_tts_task(task):
             def after_play(error):
                 if error:
                     logging.error(f"播放完成时发生错误: {error}")
-                # 使用 call_soon_threadsafe 来安全地设置 Future 的结果
-                asyncio.get_event_loop().call_soon_threadsafe(
-                    play_future.set_result, True
-                )
+                else:
+                    voice_client.last_success = time.time()
+                    voice_client.failed_attempts = 0
+                    # 创建一个新的事件循环来处理异步操作
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        loop.run_until_complete(delayed_disconnect(guild.id))
+                    finally:
+                        loop.close()
 
             if not voice_client.is_playing():
                 voice_client.play(audio_source, after=after_play)
                 # 等待播放完成
                 await play_future
-                # 创建延迟断开的任务
-                asyncio.create_task(delayed_disconnect(guild.id))
                 return
 
             await asyncio.sleep(1.0)
@@ -763,21 +783,23 @@ async def leave(ctx):
         try:
             await voice_client.disconnect()
             del guild_voice_clients[guild.id]
-            await ctx.send("已离开语音频道。", delete_after=5)
+            await send_to_command_channel(ctx.guild, content="已离开语音频道。")
         except Exception as e:
-            await ctx.send("无法离开语音频道。", delete_after=5)
+            await send_to_command_channel(ctx.guild, content="无法离开语音频道。")
             logging.error(f"离开语音频道失败: {e}")
     else:
-        await ctx.send("机器人当前不在任何语音频道。", delete_after=5)
+        await send_to_command_channel(ctx.guild, content="机器人当前不在任何语音频道。")
 
 @bot.command()
 @check_channel()
 async def test_delete(ctx):
     """测试消息删除功能"""
     try:
-        await ctx.send("这是一条测试消息，将在5秒后删除。", delete_after=5)
+        message = await send_to_command_channel(ctx.guild, content="这是一条测试消息，将在5秒后删除。")
+        await asyncio.sleep(5)
+        await message.delete()
     except Exception as e:
-        await ctx.send(f"删除失败: {e}", delete_after=5)
+        await send_to_command_channel(ctx.guild, content=f"删除失败: {e}")
 
 @bot.command()
 @check_channel()
@@ -787,20 +809,15 @@ async def play_test(ctx):
     voice_client = guild_voice_clients.get(guild.id)
     if not voice_client:
         if ctx.author.voice:
-            # 这里也加锁，避免并发连接
-            async with voice_connection_lock:
-                try:
-                    if guild.id in guild_voice_clients:
-                        await cleanup_voice_client(guild.id)
-                        await asyncio.sleep(1.0)
-                    voice_client = await ctx.author.voice.channel.connect()
-                    guild_voice_clients[guild.id] = voice_client
-                except Exception as e:
-                    logging.error(f"无法连接到语音频道: {e}")
-                    await ctx.send("无法连接到语音频道。")
-                    return
+            try:
+                voice_client = await ctx.author.voice.channel.connect()
+                guild_voice_clients[guild.id] = voice_client
+            except Exception as e:
+                logging.error(f"无法连接到语音频道: {e}")
+                await send_to_command_channel(ctx.guild, content="无法连接到语音频道。")
+                return
         else:
-            await ctx.send("你当前不在任何语音频道。")
+            await send_to_command_channel(ctx.guild, content="你当前不在任何语音频道。")
             return
 
     test_audio_path = os.path.join(TTS_CACHE_DIR, "test.mp3")
@@ -808,20 +825,20 @@ async def play_test(ctx):
         await generate_tts("这是一个测试音频。", test_audio_path)
 
     try:
-        if not os.path.exists(test_audio_path) or os.path.getsize(test_audio_path) == 0:
-            logging.error(f"测试音频文件无效或为空: {test_audio_path}")
-            await ctx.send("测试音频文件无效。")
+        if not os.path.exists(test_audio_path):
+            logging.error(f"测试音频文件不存在: {test_audio_path}")
+            await send_to_command_channel(ctx.guild, content="测试音频文件不存在。")
             return
 
         audio_source = discord.FFmpegPCMAudio(test_audio_path, executable=FFMPEG_EXECUTABLE)
         if not voice_client.is_playing():
             voice_client.play(audio_source)
-            await ctx.send("正在播放测试音频。", delete_after=5)
+            await send_to_command_channel(ctx.guild, content="正在播放测试音频。")
         else:
-            await ctx.send("语音客户端正在播放其他音频。", delete_after=5)
+            await send_to_command_channel(ctx.guild, content="语音客户端正在播放其他音频。")
     except Exception as e:
         logging.error(f"播放测试音频失败: {e}")
-        await ctx.send("播放测试音频失败。", delete_after=5)
+        await send_to_command_channel(ctx.guild, content="播放测试音频失败。")
 
 
 # -------------------------------------------------------------------
@@ -834,13 +851,13 @@ async def show_relationships(ctx):
     try:
         buf, error = await generate_co_occurrence_heatmap(ctx.guild.id)
         if error:
-            await ctx.send(error)
+            await send_to_command_channel(ctx.guild, content=error)
             return
         file = discord.File(buf, filename='relationships.png')
-        await ctx.send(file=file)
+        await send_to_command_channel(ctx.guild, file=file)
     except Exception as e:
         logging.error(f"Error in show_relationships: {e}", exc_info=True)
-        await ctx.send(f"Error generating relationship visualization: {str(e)}")
+        await send_to_command_channel(ctx.guild, content=f"Error generating relationship visualization: {str(e)}")
 
 async def generate_co_occurrence_heatmap(guild_id):
     """Generate a heatmap showing how often users are in voice channels together,
@@ -977,13 +994,13 @@ async def show_relationships_relative(ctx):
     try:
         buf, error = await generate_co_occurrence_heatmap_relative(ctx.guild.id)
         if error:
-            await ctx.send(error)
+            await send_to_command_channel(ctx.guild, content=error)
         else:
             file = discord.File(buf, filename='relative_relationships.png')
-            await ctx.send(file=file)
+            await send_to_command_channel(ctx.guild, file=file)
     except Exception as e:
         logging.error(f"Error in show_relationships_relative: {e}", exc_info=True)
-        await ctx.send(f"Error generating relative relationship visualization: {str(e)}")
+        await send_to_command_channel(ctx.guild, content=f"Error generating relative relationship visualization: {str(e)}")
 
 async def generate_co_occurrence_heatmap_relative(guild_id):
     """
@@ -1127,7 +1144,7 @@ async def stats(ctx, period: str):
     """
     valid_periods = ['daily','weekly','monthly','yearly']
     if period not in valid_periods:
-        await ctx.send("无效的周期，请输入 daily, weekly, monthly, 或 yearly。")
+        await send_to_command_channel(ctx.guild, content="无效的周期，请输入 daily, weekly, monthly, 或 yearly。")
         return
 
     await generate_report(period, ctx.guild)
@@ -1250,7 +1267,7 @@ async def generate_report(period, ctx_guild=None):
 
         if text_channel:
             try:
-                await text_channel.send(report)
+                await send_to_command_channel(guild, content=report)
                 logging.info(f"已发送 {period} 文字汇报到服务器 '{guild.name}'。")
 
                 # 2. 生成并发送柱状图
@@ -1262,7 +1279,7 @@ async def generate_report(period, ctx_guild=None):
                     logging.error(f"生成绝对时长热图失败: {error}")
                 else:
                     file = discord.File(buf, filename='relationships.png')
-                    await text_channel.send("**共同在线时长热图 (小时)**", file=file)
+                    await send_to_command_channel(guild, content="**共同在线时长热图 (小时)**", file=file)
 
                 # 4. 相对时长热图
                 buf, error = await generate_co_occurrence_heatmap_relative(guild_id)
@@ -1270,7 +1287,7 @@ async def generate_report(period, ctx_guild=None):
                     logging.error(f"生成相对时长热图失败: {error}")
                 else:
                     file = discord.File(buf, filename='relative_relationships.png')
-                    await text_channel.send("**共同在线时长热图 (百分比)**", file=file)
+                    await send_to_command_channel(guild, content="**共同在线时长热图 (百分比)**", file=file)
 
                 # 如果是自动任务（ctx_guild is None），清零对应周期的统计数据
                 if ctx_guild is None:
@@ -1357,7 +1374,7 @@ async def generate_periodic_chart(guild, period):
         try:
             with open(image_path, 'rb') as f:
                 picture = discord.File(f)
-                await text_channel.send(file=picture)
+                await send_to_command_channel(guild, file=picture)
             os.remove(image_path)
             logging.info(f"已发送 {period} 排行榜图片到服务器 '{guild.name}'。")
         except Exception as e:
@@ -1468,6 +1485,28 @@ async def cleanup_voice_client(guild_id: int):
         await asyncio.sleep(1.0)
 
     logging.info(f"已清理服务器 {guild_id} 的语音连接")
+
+async def send_to_command_channel(guild, content=None, file=None, embed=None):
+    """统一的消息发送函数，确保消息发送到命令频道"""
+    global command_channel
+    try:
+        if not command_channel:
+            command_channel = guild.get_channel(ALLOWED_COMMAND_CHANNEL_ID)
+            if not command_channel:
+                logging.error(f"无法找到指定的命令频道 ID: {ALLOWED_COMMAND_CHANNEL_ID}")
+                return
+
+        logging.info(f"正在发送消息到命令频道: {command_channel.name}")  # 输出频道名称
+
+        if content:
+            await command_channel.send(content)
+        if file:
+            await command_channel.send(file=file)
+        if embed:
+            await command_channel.send(embed=embed)
+    except Exception as e:
+        logging.error(f"发送消息到命令频道时出错: {e}")
+
 
 async def main():
     try:
