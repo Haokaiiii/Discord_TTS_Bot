@@ -706,20 +706,23 @@ async def handle_tts_task(task):
             )
             audio_source = discord.PCMVolumeTransformer(audio_source, volume=1.0)
 
+            # 创建一个 Future 对象来跟踪播放完成
+            play_future = asyncio.Future()
+
             def after_play(error):
                 if error:
                     logging.error(f"播放完成时发生错误: {error}")
-                else:
-                    voice_client.last_success = time.time()
-                    voice_client.failed_attempts = 0
-                    # 创建异步任务来处理延迟断开
-                    asyncio.create_task(delayed_disconnect(guild.id))
+                # 使用 call_soon_threadsafe 来安全地设置 Future 的结果
+                asyncio.get_event_loop().call_soon_threadsafe(
+                    play_future.set_result, True
+                )
 
             if not voice_client.is_playing():
                 voice_client.play(audio_source, after=after_play)
                 # 等待播放完成
-                while voice_client.is_playing():
-                    await asyncio.sleep(0.1)
+                await play_future
+                # 创建延迟断开的任务
+                asyncio.create_task(delayed_disconnect(guild.id))
                 return
 
             await asyncio.sleep(1.0)
@@ -737,16 +740,18 @@ async def handle_tts_task(task):
 
 async def delayed_disconnect(guild_id: int):
     """30秒后断开语音连接"""
-    await asyncio.sleep(30)  # 等待30秒
-    voice_client = guild_voice_clients.get(guild_id)
-    
-    if voice_client and voice_client.is_connected():
-        try:
+    try:
+        await asyncio.sleep(30)  # 等待30秒
+        voice_client = guild_voice_clients.get(guild_id)
+        
+        if voice_client and voice_client.is_connected():
             if not voice_client.is_playing():  # 确保没有在播放其他内容
                 await cleanup_voice_client(guild_id)
                 logging.info(f"已自动断开与服务器 {guild_id} 的语音连接")
-        except Exception as e:
-            logging.error(f"自动断开语音连接时发生错误: {e}")
+            else:
+                logging.info(f"服务器 {guild_id} 仍在播放内容，取消自动断开")
+    except Exception as e:
+        logging.error(f"自动断开语音连接时发生错误: {e}")
 
 @bot.command()
 @check_channel()
