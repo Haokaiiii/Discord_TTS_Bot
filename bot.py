@@ -1440,44 +1440,37 @@ async def check_voice_connections():
 
 # --- 修改 cleanup_voice_client，断开并确保彻底清理 ---
 async def cleanup_voice_client(guild_id: int):
-    """
-    强制清理指定 guild 的语音连接：
-    - 断开真正的 Discord 连接
-    - 从 guild_voice_clients 中删除
-    """
-    guild = bot.get_guild(guild_id)
-    if not guild:
-        return
+    """清理语音客户端的所有状态"""
+    try:
+        # 获取并清理全局字典中的引用
+        voice_client = guild_voice_clients.pop(guild_id, None)
+        
+        if voice_client:
+            try:
+                # 强制断开连接
+                if voice_client.is_connected():
+                    await voice_client.disconnect(force=True)
+            except Exception as e:
+                logging.error(f"断开语音连接时发生错误: {e}")
+            
+            # 确保清理所有相关资源
+            try:
+                voice_client.cleanup()
+            except:
+                pass
 
-    vc_in_dict = guild_voice_clients.get(guild_id)
-    vc_in_guild = guild.voice_client
+        # 额外检查并清理服务器中的所有语音连接
+        guild = bot.get_guild(guild_id)
+        if guild:
+            for vc in guild.voice_clients:
+                try:
+                    await vc.disconnect(force=True)
+                except:
+                    pass
 
-    to_disconnect = set()
-    if vc_in_dict and vc_in_dict.is_connected():
-        to_disconnect.add(vc_in_dict)
-    if vc_in_guild and vc_in_guild.is_connected():
-        to_disconnect.add(vc_in_guild)
-
-    for vc in to_disconnect:
-        try:
-            await vc.disconnect(force=True)
-        except Exception as e:
-            logging.error(f"清理语音连接时发生错误 (Guild ID: {guild_id}): {e}")
-
-    guild_voice_clients.pop(guild_id, None)
-    await asyncio.sleep(5.0)
-
-    # 二次检查
-    still_vc = guild.voice_client
-    if still_vc and still_vc.is_connected():
-        logging.warning(f"清理后依旧连着，再尝试一次 (Guild ID: {guild_id})")
-        try:
-            await still_vc.disconnect(force=True)
-        except Exception as e:
-            logging.error(f"第二次清理语音连接时发生错误: {e}")
-        await asyncio.sleep(1.0)
-
-    logging.info(f"已清理服务器 {guild_id} 的语音连接")
+        logging.info("确认已与语音频道断开。")
+    except Exception as e:
+        logging.error(f"清理语音客户端时发生错误: {e}")
 
 async def send_to_command_channel(guild, content=None, file=None, embed=None):
     """统一的消息发送函数，确保消息发送到命令频道"""
