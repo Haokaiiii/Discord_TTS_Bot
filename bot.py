@@ -327,7 +327,11 @@ def get_preferred_name(member):
 
 def check_channel():
     async def predicate(ctx):
-        return ctx.channel.id == ALLOWED_COMMAND_CHANNEL_ID
+        is_allowed = ctx.channel.id == ALLOWED_COMMAND_CHANNEL_ID
+        if not is_allowed:
+            # 如果不是指定频道，直接忽略命令
+            return False
+        return True
     return commands.check(predicate)
 
 @bot.command()
@@ -1385,18 +1389,11 @@ class BotException(Exception):
 async def handle_command_error(ctx, error):
     """Global error handler for commands"""
     if isinstance(error, commands.CheckFailure):
-        if ctx.channel.id == ALLOWED_COMMAND_CHANNEL_ID:
-            await ctx.send("此命令只能在指定的频道中使用。")
+        # 如果是因为频道检查失败，直接忽略
         return
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("You don't have permission to use this command.")
-    elif isinstance(error, commands.BotMissingPermissions):
-        await ctx.send("I don't have the required permissions to execute this command.")
-    elif isinstance(error, commands.CommandOnCooldown):
-        await ctx.send(f"This command is on cooldown. Try again in {error.retry_after:.2f}s")
     else:
-        logging.error(f"Command error in {ctx.command}: {error}", exc_info=True)
-        await ctx.send("An error occurred while processing your command.")
+        # 其他错误正常处理
+        logging.error(f"Command error in {ctx.command}: {str(error)}")
 
 bot.on_command_error = handle_command_error
 
