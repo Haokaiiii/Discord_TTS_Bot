@@ -1459,10 +1459,9 @@ async def cleanup_voice_client(guild_id: int):
             except:
                 pass
 
-        # 额外检查并清理服务器中的所有语音连接
-        guild = bot.get_guild(guild_id)
-        if guild:
-            for vc in guild.voice_clients:
+        # 使用 bot.voice_clients 而不是 guild.voice_clients
+        for vc in bot.voice_clients:
+            if vc.guild.id == guild_id:
                 try:
                     await vc.disconnect(force=True)
                 except:
