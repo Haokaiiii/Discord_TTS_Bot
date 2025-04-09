@@ -6,22 +6,25 @@ WORKDIR /app
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
     gcc \
-    python3-dev
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
 COPY requirements.txt .
-RUN pip wheel --no-cache-dir --no-deps --wheel-dir /app/wheels -r requirements.txt
+# Consider adding --prefer-binary for faster builds if wheels are available
+RUN pip wheel --no-cache-dir --wheel-dir /app/wheels -r requirements.txt
 
 # Final stage
 FROM python:3.10-slim
 
 # Create non-root user
-RUN useradd -m -u 1000 botuser
+RUN useradd --system --create-home --uid 1000 botuser
 
 WORKDIR /app
 
 # Install runtime dependencies and fonts with better CJK support
-RUN apt-get update && apt-get install -y \
+# Combine RUN commands and clean up apt cache
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libnss3 \
     libasound2 \
@@ -33,10 +36,9 @@ RUN apt-get update && apt-get install -y \
     fonts-wqy-zenhei \
     fonts-arphic-ukai \
     fonts-arphic-uming \
-    libnss3 \
-    libasound2 \
-    wget \
+    ca-certificates \
     && fc-cache -fv \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy wheels from builder
@@ -44,33 +46,42 @@ COPY --from=builder /app/wheels /wheels
 COPY --from=builder /app/requirements.txt .
 
 # Install Python packages
-RUN pip install --no-cache /wheels/*
+RUN pip install --no-cache-dir /wheels/*
 
-# Copy application
-COPY . .
+# Copy application code (after installing dependencies)
+# Copy specific directories/files instead of '.' for better cache utilization
+COPY main.py ./
+COPY utils/ ./utils/
+COPY cogs/ ./cogs/
+COPY .env ./
+# Note: Copying .env into the image is generally NOT recommended for production.
+# Consider using Docker secrets or environment variables injected at runtime.
 
 # Create necessary directories and set permissions
+# Ensure these match the paths used in config.py (if different from WORKDIR)
 RUN mkdir -p /app/tts_cache /app/data_backup /app/mplconfig \
     && chown -R botuser:botuser /app \
-    && chmod -R 755 /app
+    && chmod -R 700 /app/tts_cache /app/data_backup /app/mplconfig \
+    && chmod 755 /app/main.py \
+    && chmod -R 755 /app/utils /app/cogs
 
-# Create fonts directory with permissions
-RUN mkdir -p /usr/share/fonts/truetype/custom && chmod -R 777 /usr/share/fonts/truetype/custom
-
-# Set environment variables
+# Set environment variables (MPLCONFIGDIR helps matplotlib find a writable dir)
 ENV MPLCONFIGDIR=/app/mplconfig
 ENV PYTHONUNBUFFERED=1
 ENV TZ=Australia/Sydney
+# Consider setting PYTHONIOENCODING=UTF-8
 
-# Rebuild font cache
-RUN fc-cache -fv
+# Rebuild font cache (already done during install)
+# RUN fc-cache -fv
 
 # Switch to non-root user
 USER botuser
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import requests; requests.get('http://localhost:8080/health')" || exit 1
+# Health check (adjust port if changed in config.py)
+# Use curl or wget if requests isn't guaranteed to be available early
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD wget --quiet --tries=1 --spider http://localhost:8080/health || exit 1
+# Or: CMD curl --fail http://localhost:8080/health || exit 1
 
-# Run application
-CMD ["python", "bot.py"]
+# Run application using the new entrypoint
+CMD ["python", "main.py"]
