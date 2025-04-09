@@ -1,14 +1,16 @@
-discord.py
-gTTS==2.2.3
-PyNaCl==1.5.0
-matplotlib==3.7.2
-seaborn==0.12.2
-pyttsx3==2.90
-backoff==2.2.1
-aiohttp==3.8.5
-apscheduler==3.10.1
-pytz==2023.3
-numpy==1.23.5
-pandas==2.1.1
-pymongo
+discord.py>=2.0.0
 python-dotenv
+pymongo[srv]
+gTTS
+asyncio
+seaborn
+matplotlib
+pytz
+numpy
+pandas
+backoff
+aiohttp
+APScheduler
+networkx # Added for relationship graph
+PyNaCl # Needed for voice support
+scipy # Added for kamada_kawai_layout in plotting

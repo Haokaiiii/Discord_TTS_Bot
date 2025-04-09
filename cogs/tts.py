@@ -31,6 +31,13 @@ class TTSCog(commands.Cog):
         self.cleanup_tts_files.start()
         self.check_voice_connections.start()
         logging.info("TTSCog initialized.")
+        self.tts_queue = defaultdict(lambda: asyncio.Queue(maxsize=10)) # {guild_id: Queue[Tuple[str, discord.VoiceChannel, discord.Member]]}
+        self.tts_processor_tasks = {} # {guild_id: asyncio.Task}
+        self.guild_locks = defaultdict(asyncio.Lock) # {guild_id: Lock}
+        self.debounce_timers = defaultdict(dict) # {guild_id: {member_id: asyncio.TimerHandle}}
+        self.loop = asyncio.get_event_loop() # Store the main event loop
+        # User ID for special TTS message (Replace if needed)
+        self.special_user_id = 647282381841104897 
 
     def cog_unload(self):
         self.cleanup_tts_files.cancel()
@@ -44,145 +51,148 @@ class TTSCog(commands.Cog):
         logging.info("TTSCog unloaded.")
 
     async def _safe_disconnect(self, vc: discord.VoiceClient):
-        """Safely disconnects a voice client, handling potential errors."""
+        """Safely disconnects a voice client, handling potential errors and timeout."""
         if vc and vc.is_connected():
             guild_id = vc.guild.id
-            logging.info(f"Safely disconnecting from voice channel in guild {guild_id}")
+            logging.info(f"Safely disconnecting from voice channel {vc.channel.id} in guild {guild_id}")
             try:
                 async with voice_connection_lock:
                     if vc.is_playing():
                         vc.stop()
-                    await vc.disconnect(force=True)
-                    logging.info(f"Successfully disconnected from voice in guild {guild_id}")
+                    # Add timeout to the disconnect call itself
+                    try:
+                        await asyncio.wait_for(vc.disconnect(force=True), timeout=5.0) 
+                        logging.info(f"Successfully disconnected from voice in guild {guild_id}")
+                    except asyncio.TimeoutError:
+                        logging.error(f"Timeout waiting for disconnect confirmation from Discord for guild {guild_id}. Proceeding with cleanup.")
+                        # Force internal state update even if Discord didn't confirm
+                    except Exception as inner_e:
+                        logging.error(f"Error during vc.disconnect call in guild {guild_id}: {inner_e}", exc_info=True)
+
             except Exception as e:
-                logging.error(f"Error during safe disconnect in guild {guild_id}: {e}", exc_info=True)
+                # Catch errors acquiring lock or other unexpected issues
+                logging.error(f"Error during outer safe disconnect logic in guild {guild_id}: {e}", exc_info=True)
             finally:
+                # Cleanup internal state regardless of disconnect success/timeout
                 guild_voice_clients.pop(guild_id, None)
-                guild_tts_queues.pop(guild_id, None)
-                if guild_id in guild_tts_tasks:
-                    guild_tts_tasks[guild_id].cancel()
-                    guild_tts_tasks.pop(guild_id, None)
+                # Reset relevant states (consider if queue/task cleanup needed here)
+                # guild_tts_queues.pop(guild_id, None)
+                # if guild_id in self.tts_processor_tasks:
+                #     self.tts_processor_tasks[guild_id].cancel()
+                #     self.tts_processor_tasks.pop(guild_id, None)
                 reconnecting_guilds.discard(guild_id)
+        # else:
+             # logging.debug(f"_safe_disconnect called but VC not connected or invalid.")
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-        """Handles TTS announcements for voice channel joins, leaves, and switches."""
         if member.bot:
             return
 
         guild = member.guild
         guild_id = guild.id
         member_id = member.id
-        name = get_preferred_name(member)
 
         before_channel = before.channel
         after_channel = after.channel
-
-        # Ignore events in excluded channels unless they are leaving an excluded channel
         is_before_excluded = before_channel and before_channel.id in EXCLUDED_VOICE_CHANNEL_IDS
         is_after_excluded = after_channel and after_channel.id in EXCLUDED_VOICE_CHANNEL_IDS
 
-        # --- JOIN --- (From None or Excluded to a valid channel)
+        action_type = None
+        target_channel_for_debounce = None
+
+        # Determine action type
         if (not before_channel or is_before_excluded) and (after_channel and not is_after_excluded):
-            # Cancel any pending switch task for this member
-            switch_task = pending_switch_tasks.pop((guild_id, member_id), None)
-            if switch_task:
-                switch_task.cancel()
-                logging.debug(f"Cancelled pending switch task for {name} ({member_id}) due to join.")
-
-            # Check permissions before queueing
-            if not has_required_permissions(after_channel):
-                 logging.warning(f"Missing permissions to join/speak in {after_channel.name} ({after_channel.id}). Cannot announce join for {name}.")
-                 return
-            message = f'{name} 加入了频道'
-            logging.info(f"Queueing TTS for join: {message} in G:{guild_id} C:{after_channel.id}")
-            await self.queue_tts(guild, after_channel, message)
-
-        # --- LEAVE --- (From valid channel to None or Excluded)
+            action_type = 'join'
+            target_channel_for_debounce = after_channel
         elif (before_channel and not is_before_excluded) and (not after_channel or is_after_excluded):
-            # Cancel any pending switch task
-            switch_task = pending_switch_tasks.pop((guild_id, member_id), None)
-            if switch_task:
-                switch_task.cancel()
-                logging.debug(f"Cancelled pending switch task for {name} ({member_id}) due to leave.")
-
-            # Check permissions before queueing
-            if not has_required_permissions(before_channel):
-                 logging.warning(f"Missing permissions in {before_channel.name} ({before_channel.id}) where {name} left. Cannot announce leave.")
-                 # Might still want to try and disconnect if bot is alone?
-                 if len(before_channel.members) == 1 and before_channel.members[0] == guild.me:
-                      logging.info(f"Bot is alone in {before_channel.name}, attempting disconnect.")
-                      vc = guild_voice_clients.get(guild_id)
-                      if vc and vc.channel == before_channel:
-                          await self._safe_disconnect(vc)
-                 return
-
-            message = f'{name} 离开了频道'
-            logging.info(f"Queueing TTS for leave: {message} in G:{guild_id} C:{before_channel.id}")
-            await self.queue_tts(guild, before_channel, message)
-
-            # Check if the bot should disconnect after announcing the leave
-            await self.check_and_disconnect_if_alone(guild_id, before_channel)
-
-        # --- SWITCH --- (From valid channel to another valid channel)
+            action_type = 'leave'
+            target_channel_for_debounce = before_channel # Announce in the channel they left
         elif (before_channel and not is_before_excluded) and \
              (after_channel and not is_after_excluded) and \
              before_channel != after_channel:
+            action_type = 'switch'
+            target_channel_for_debounce = after_channel # Announce in the destination channel
 
-            # If a switch task is already pending, cancel it (user switched again quickly)
-            existing_task = pending_switch_tasks.pop((guild_id, member_id), None)
-            if existing_task:
-                existing_task.cancel()
-                logging.debug(f"Cancelled existing switch task for {name} ({member_id}) due to rapid switch.")
+        # If a relevant action occurred
+        if action_type and target_channel_for_debounce:
+            # --- Debounce Logic --- 
+            timer_key = (guild_id, member_id)
+            
+            # If a timer already exists for this user, cancel it
+            if timer_key in self.debounce_timers:
+                self.debounce_timers[timer_key].cancel()
+                logging.debug(f"Cancelled existing debounce timer for {member.display_name} ({member_id}) in guild {guild_id}")
+                # No need to remove here, call_later replaces
 
-            # Check permissions for the *destination* channel
-            if not has_required_permissions(after_channel):
-                logging.warning(f"Missing permissions in destination channel {after_channel.name} ({after_channel.id}). Cannot announce switch for {name}.")
-                # Announce leave in the original channel if possible?
-                if has_required_permissions(before_channel):
-                     leave_message = f'{name} 离开了频道'
-                     logging.info(f"Queueing TTS for leave part of failed switch: {leave_message} in G:{guild_id} C:{before_channel.id}")
-                     await self.queue_tts(guild, before_channel, leave_message)
-                     await self.check_and_disconnect_if_alone(guild_id, before_channel)
-                return
+            # Start a new debounce timer
+            logging.info(f"Detected {action_type} for {member.display_name} ({member_id}). Starting debounce timer ({DEBOUNCE_TIME}s) for channel {target_channel_for_debounce.id}.")
+            self.debounce_timers[timer_key] = self.loop.call_later(
+                DEBOUNCE_TIME,
+                lambda: asyncio.create_task( # Use lambda to avoid immediate coro creation
+                    self._debounce_tts_queue(member, before, after, action_type, target_channel_for_debounce)
+                )
+            )
 
-            logging.info(f"Detected switch for {name} ({member_id}) from {before_channel.id} to {after_channel.id}. Starting debounce timer ({DEBOUNCE_TIME}s).")
-            # Start a delayed task to announce the switch
-            task = asyncio.create_task(self.delayed_switch_broadcast(guild, member, after_channel))
-            pending_switch_tasks[(guild_id, member_id)] = task
+        # --- Disconnect Check --- (Independent of debounce)
+        # Check if the bot should disconnect from the 'before' channel if it was valid and might now be empty
+        if before_channel and not is_before_excluded and action_type in ['leave', 'switch']:
+             await self.check_and_disconnect_if_alone(guild_id, before_channel, guild)
+        
+        # NOTE: Removed the immediate queue_tts calls from here.
+        # All TTS queuing is now handled by _debounce_tts_queue.
 
-            # Check if bot needs to leave the *origin* channel
-            await self.check_and_disconnect_if_alone(guild_id, before_channel)
-
-    async def delayed_switch_broadcast(self, guild: discord.Guild, member: discord.Member, voice_channel: discord.VoiceChannel):
-        """Waits for DEBOUNCE_TIME then queues the switch announcement if still valid."""
-        guild_id = guild.id
+    async def _debounce_tts_queue(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState, action_type: str, target_channel: discord.VoiceChannel):
+        """Called after debounce timer; generates text and queues TTS."""
+        guild_id = member.guild.id
         member_id = member.id
-        name = get_preferred_name(member)
-        await asyncio.sleep(DEBOUNCE_TIME)
+        member_name = get_preferred_name(member)
+        timer_key = (guild_id, member_id)
 
-        # Check if the task was cancelled or the member is no longer in the target channel
-        if (guild_id, member_id) not in pending_switch_tasks:
-             logging.info(f"Debounced switch task for {name} ({member_id}) cancelled or already handled.")
-             return
+        # Clean up the finished timer handle reference
+        self.debounce_timers.pop(timer_key, None)
 
-        # Double check the member's current state *after* the delay
-        current_state = member.voice
-        if not current_state or current_state.channel != voice_channel:
-            logging.info(f"Member {name} ({member_id}) is no longer in {voice_channel.name} after debounce. Aborting switch announcement.")
-            pending_switch_tasks.pop((guild_id, member_id), None) # Clean up task entry
+        # Re-check member state *after* delay 
+        current_voice_state = member.voice
+        expected_channel_id = target_channel.id
+        current_channel_id = current_voice_state.channel.id if current_voice_state and current_voice_state.channel else None
+
+        # --- More detailed logging for skipped announcements --- 
+        skip_reason = None
+        if action_type == 'leave':
+            if current_channel_id and current_channel_id not in EXCLUDED_VOICE_CHANNEL_IDS:
+                 skip_reason = f"User {member_name} rejoined/moved to channel {current_channel_id} during leave debounce."
+            elif not has_required_permissions(target_channel):
+                 skip_reason = f"Missing permissions in original channel {target_channel.id} to announce leave."
+        elif action_type in ['join', 'switch']:
+             if current_channel_id != expected_channel_id:
+                 skip_reason = f"User {member_name} not in expected channel {expected_channel_id} after debounce (current: {current_channel_id})."
+             elif not has_required_permissions(target_channel):
+                 skip_reason = f"Missing permissions in destination channel {target_channel.id} to announce {action_type}."
+        
+        if skip_reason:
+            logging.info(f"Aborting {action_type} announcement for {member_name}: {skip_reason}")
             return
+        # --- End logging --- 
 
-        # Check permissions again right before queueing
-        if not has_required_permissions(voice_channel):
-            logging.warning(f"Missing permissions in {voice_channel.name} ({voice_channel.id}) after debounce. Cannot announce switch for {name}.")
-            pending_switch_tasks.pop((guild_id, member_id), None)
-            return
+        # Generate TTS text based on action and user
+        tts_text = ""
+        if action_type == 'join':
+            if member_id == self.special_user_id:
+                tts_text = f"欢迎我的主人{member_name}, muamuamua"
+            else:
+                tts_text = f"欢迎 {member_name}"
+        elif action_type == 'leave':
+             tts_text = f"{member_name} 滚了"
+        elif action_type == 'switch':
+             tts_text = f"{member_name} 叛变了"
 
-        message = f'{name} 切换到了频道'
-        logging.info(f"Debounce finished. Queueing TTS for switch: {message} in G:{guild_id} C:{voice_channel.id}")
-        await self.queue_tts(guild, voice_channel, message)
-        pending_switch_tasks.pop((guild_id, member_id), None) # Clean up task entry
+        if tts_text:
+            logging.info(f"Debounce finished. Queueing TTS for {action_type}: {tts_text} in G:{guild_id} C:{target_channel.id}")
+            await self.queue_tts(member.guild, target_channel, tts_text)
+        else:
+            # This case should ideally not happen if skip logic is correct
+            logging.warning(f"Debounce finished for {action_type} by {member_name}. No TTS text generated despite passing checks.")
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
@@ -206,49 +216,64 @@ class TTSCog(commands.Cog):
             await self.queue_tts(guild, voice_channel, message)
 
     async def queue_tts(self, guild: discord.Guild, voice_channel: discord.VoiceChannel, message: str):
-        """Adds a TTS message to the guild's queue and ensures the processing task is running."""
+        """Adds a TTS message to the guild's asyncio Queue and ensures the processing task is running."""
         guild_id = guild.id
         if not message:
             return
+
+        # Ensure cache directory exists
+        os.makedirs(TTS_CACHE_DIR, exist_ok=True)
 
         # Generate TTS file path (hash message for caching)
         text_hash = hashlib.md5(message.encode('utf-8')).hexdigest()
         output_filename = f"{text_hash}.mp3"
         output_path = os.path.join(TTS_CACHE_DIR, output_filename)
 
-        # Add to queue
-        guild_tts_queues[guild_id].append((voice_channel, message, output_path))
-        logging.debug(f"Added to TTS queue for guild {guild_id}: '{message[:30]}...' Target: {voice_channel.name}")
+        # Add to the COG'S asyncio.Queue
+        try:
+            # Package necessary context (guild needed for disconnect check later)
+            await self.tts_queue[guild_id].put((voice_channel, message, guild, output_path))
+            logging.debug(f"Added to asyncio TTS queue for guild {guild_id}: '{message[:30]}...' Target: {voice_channel.name}")
+        except asyncio.QueueFull:
+            logging.warning(f"TTS queue full for guild {guild_id}. Skipping message: '{message[:30]}...'")
+            return # Skip if queue is full
 
-        # Ensure the processing task for this guild is running
-        if guild_id not in guild_tts_tasks or guild_tts_tasks[guild_id].done():
-            logging.info(f"Starting TTS processing task for guild {guild_id}.")
-            guild_tts_tasks[guild_id] = asyncio.create_task(self.process_guild_tts_queue(guild_id))
-            # Handle task completion/exceptions
-            guild_tts_tasks[guild_id].add_done_callback(self._handle_tts_task_completion)
+        # Ensure the processing task for this guild is running using self.tts_processor_tasks
+        if guild_id not in self.tts_processor_tasks or self.tts_processor_tasks[guild_id].done():
+            logging.info(f"Starting TTS processing task for guild {guild_id} using asyncio.Queue.")
+            self.tts_processor_tasks[guild_id] = asyncio.create_task(self.process_guild_tts_queue(guild_id))
+            self.tts_processor_tasks[guild_id].add_done_callback(self._handle_tts_task_completion)
 
     def _handle_tts_task_completion(self, task: asyncio.Task):
-        """Callback to log exceptions from the TTS processing task."""
+        # Use self.tts_processor_tasks
+        guild_id = None
+        for gid, t in list(self.tts_processor_tasks.items()): # Iterate copy
+            if t == task:
+                guild_id = gid
+                del self.tts_processor_tasks[gid] # Remove completed/failed task
+                break
         try:
             task.result() # Raise exception if one occurred
+            logging.info(f"TTS processing task for guild {guild_id or 'Unknown'} completed normally.")
         except asyncio.CancelledError:
-            logging.info(f"TTS processing task cancelled.") # Expected during shutdown/reloads
+            logging.info(f"TTS processing task for guild {guild_id or 'Unknown'} cancelled.")
         except Exception as e:
-            # Find guild ID associated with this task (if possible)
-            guild_id = None
-            for gid, t in guild_tts_tasks.items():
-                if t == task:
-                    guild_id = gid
-                    break
             logging.error(f"TTS processing task for guild {guild_id or 'Unknown'} failed: {e}", exc_info=True)
-            # Optionally, try restarting the task after a delay?
-            if guild_id:
-                 guild_tts_tasks.pop(guild_id, None) # Remove the failed task entry
 
-
-    async def generate_tts_async(self, text: str, output_path: str):
-        """Generates TTS audio file using gTTS in a ThreadPoolExecutor."""
+    async def generate_tts_async(self, text: str) -> str | None:
+        """Generates TTS audio file using gTTS in a ThreadPoolExecutor, returns path on success."""
         loop = asyncio.get_event_loop()
+        # Generate path within this function
+        text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
+        output_filename = f"{text_hash}.mp3"
+        output_path = os.path.join(TTS_CACHE_DIR, output_filename)
+
+        # Check cache first
+        if os.path.exists(output_path):
+             logging.debug(f"Using cached TTS file: {output_path}")
+             return output_path
+
+        logging.debug(f"Generating TTS file: {output_path}")
         try:
             await loop.run_in_executor(
                 tts_executor,
@@ -257,130 +282,154 @@ class TTSCog(commands.Cog):
                 output_path
             )
             logging.info(f"Successfully generated TTS file: {output_path}")
-            return True
+            return output_path
         except Exception as e:
             logging.error(f"Failed to generate TTS for '{text[:30]}...': {e}", exc_info=True)
-            # Attempt to clean up potentially partial file
-            try:
-                 if os.path.exists(output_path):
-                     os.remove(output_path)
-            except OSError as oe:
-                 logging.error(f"Error removing failed TTS file {output_path}: {oe}")
-            return False
+            try: # Attempt cleanup
+                 if os.path.exists(output_path): os.remove(output_path)
+            except OSError as oe: logging.error(f"Error removing failed TTS file {output_path}: {oe}")
+            return None # Indicate failure
 
     def _blocking_gtts_call(self, text: str, output_path: str):
         """The actual blocking gTTS call. DO NOT run this directly in the main event loop."""
         tts = gTTS(text=text, lang='zh-cn')
         tts.save(output_path)
 
-
     async def process_guild_tts_queue(self, guild_id: int):
-        """Processes the TTS queue for a specific guild, one message at a time."""
+        """Processes the TTS asyncio.Queue for a specific guild."""
         guild = self.bot.get_guild(guild_id)
         if not guild:
             logging.error(f"Cannot process TTS queue: Guild {guild_id} not found.")
-            guild_tts_queues.pop(guild_id, None)
+            # Consider clearing self.tts_queue[guild_id] here if necessary
             return
+        
+        logging.info(f"TTS queue processor started for guild {guild_id}.")
 
-        while guild_id in guild_tts_queues and guild_tts_queues[guild_id]:
+        while True:
             try:
-                voice_channel, message, tts_path = guild_tts_queues[guild_id].popleft()
-                logging.info(f"Processing TTS for guild {guild_id}: '{message[:30]}...' in {voice_channel.name}")
+                # --- CRITICAL FIX: Use self.tts_queue (asyncio.Queue) --- 
+                logging.debug(f"G:{guild_id} Waiting for item from asyncio.Queue...")
+                # Wait indefinitely until an item is available or task is cancelled
+                # Ensure item structure matches what queue_tts puts
+                target_channel, tts_text, guild_context, tts_path = await self.tts_queue[guild_id].get() 
+                logging.debug(f"G:{guild_id} Got item: '{tts_text[:30]}...' for C:{target_channel.id}")
+                # Use the guild object received from the queue for consistency
+                guild = guild_context 
+                # --- END CRITICAL FIX --- 
 
-                # 0. Check if channel still exists and has members (besides bot)
-                refreshed_channel = guild.get_channel(voice_channel.id)
+                # Refresh channel state and check members
+                refreshed_channel = self.bot.get_channel(target_channel.id)
                 if not refreshed_channel or not isinstance(refreshed_channel, discord.VoiceChannel):
-                     logging.warning(f"Target channel {voice_channel.name} ({voice_channel.id}) no longer exists. Skipping TTS.")
-                     continue
-                if not any(m for m in refreshed_channel.members if not m.bot):
-                     logging.info(f"Target channel {refreshed_channel.name} is empty (or only contains bots). Skipping TTS: '{message[:30]}...'")
-                     # Check if bot should leave
-                     await self.check_and_disconnect_if_alone(guild_id, refreshed_channel)
-                     continue
+                    logging.warning(f"G:{guild_id} Target channel {target_channel.id} no longer exists/invalid. Skipping.")
+                    self.tts_queue[guild_id].task_done() # Mark item as processed
+                    continue
 
-                # 1. Check/Generate TTS file
+                human_members = [m for m in refreshed_channel.members if not m.bot]
+                vc = guild.voice_client # Get current VC for this guild
+
+                # Check if channel empty *before* connecting/playing
+                if not human_members and (not vc or vc.channel != refreshed_channel):
+                    logging.info(f"G:{guild_id} C:{refreshed_channel.id} is empty. Skipping TTS: '{tts_text[:30]}...'")
+                    self.tts_queue[guild_id].task_done()
+                    continue 
+                elif not human_members and vc and vc.channel == refreshed_channel:
+                     logging.info(f"G:{guild_id} C:{refreshed_channel.id} only contains bot. Skipping TTS: '{tts_text[:30]}...'. Disconnecting.")
+                     await self._safe_disconnect(vc)
+                     self.tts_queue[guild_id].task_done()
+                     continue 
+
+                # Check/Generate TTS file (Path was already determined by queue_tts)
                 if not os.path.exists(tts_path):
-                    logging.debug(f"TTS file {tts_path} not found in cache. Generating...")
-                    success = await self.generate_tts_async(message, tts_path)
-                    if not success:
-                        logging.error(f"Skipping TTS for '{message[:30]}...' due to generation failure.")
-                        continue # Skip to next item in queue
+                     logging.debug(f"G:{guild_id} Generating TTS file (not found in cache): {tts_path}")
+                     # This call generates the file if needed, returns None on failure
+                     generated_path = await self.generate_tts_async(tts_text) 
+                     if not generated_path:
+                         logging.error(f"G:{guild_id} Failed to generate TTS file for: {tts_text[:30]}... Skipping.")
+                         self.tts_queue[guild_id].task_done()
+                         continue
+                     # Should normally be the same path, but use returned path just in case
+                     tts_path = generated_path 
                 else:
-                     logging.debug(f"Using cached TTS file: {tts_path}")
+                    logging.debug(f"G:{guild_id} Using cached TTS file: {tts_path}")
 
-                # 2. Get Voice Client (Connect if necessary)
-                vc = await self._get_or_connect_vc(guild, refreshed_channel)
+                # Get or connect voice client
+                vc = await self._get_or_connect_vc(guild, refreshed_channel) # Pass guild object
                 if not vc:
-                    logging.error(f"Failed to get voice client for guild {guild_id}, channel {refreshed_channel.id}. Skipping TTS.")
-                    # Could potentially re-queue the message, but might lead to loops
+                    logging.error(f"G:{guild_id} Failed to get voice client for C:{refreshed_channel.id}. Skipping TTS.")
+                    self.tts_queue[guild_id].task_done()
                     continue
 
-                # 3. Play TTS
-                if vc.is_playing() or vc.is_paused():
-                    logging.warning(f"Voice client in guild {guild_id} is already playing/paused. Waiting might be needed, but currently skipping: '{message[:30]}...'")
-                    # Re-queue the message at the front for next iteration?
-                    # guild_tts_queues[guild_id].appendleft((voice_channel, message, tts_path))
-                    # await asyncio.sleep(0.5) # Small delay before next attempt
-                    # Let's skip for now to avoid complex queue/state management
-                    continue
-
+                # Playback logic 
                 logging.info(f"Playing TTS in G:{guild_id} C:{refreshed_channel.id}: {tts_path}")
-                # Use lock to prevent concurrent play attempts on the same VC
                 async with voice_connection_lock:
-                    if not vc.is_connected(): # Check connection again inside lock
-                        logging.warning(f"VC for G:{guild_id} disconnected before playback could start. Skipping.")
+                    # Re-check connection status after acquiring lock
+                    if not vc.is_connected():
+                        logging.warning(f"G:{guild_id} VC disconnected before playback locked. Skipping.")
+                        self.tts_queue[guild_id].task_done()
                         continue
                     
+                    # Check if already playing (should be prevented by lock, but belts and suspenders)
+                    if vc.is_playing():
+                         logging.warning(f"G:{guild_id} VC is already playing. Skipping TTS: '{tts_text[:30]}...'")
+                         self.tts_queue[guild_id].task_done() # Skip this item
+                         continue
+
                     playback_finished = asyncio.Event()
+                    
                     def after_play(error):
-                        if error:
-                            logging.error(f"Error during TTS playback in guild {guild_id}: {error}")
-                        else:
-                            logging.debug(f"Finished playing TTS in guild {guild_id}: {tts_path}")
-                        # Signal that playback is finished, regardless of error
-                        asyncio.get_event_loop().call_soon_threadsafe(playback_finished.set)
-                        # Check if bot should disconnect *after* playing
-                        # Need to run this check in the main event loop
-                        asyncio.run_coroutine_threadsafe(self.check_and_disconnect_if_alone(guild_id, refreshed_channel), self.bot.loop)
+                        if error: logging.error(f"G:{guild_id} Playback error: {error}")
+                        else: logging.debug(f"G:{guild_id} Playback finished: {tts_path}")
+                        self.loop.call_soon_threadsafe(playback_finished.set)
+                        asyncio.run_coroutine_threadsafe(self.check_and_disconnect_if_alone(guild_id, refreshed_channel, guild), self.loop)
 
                     try:
                         audio_source = discord.FFmpegPCMAudio(tts_path, executable=FFMPEG_EXECUTABLE)
                         vc.play(audio_source, after=after_play)
-
-                        # Wait for playback to finish (with a timeout)
                         try:
-                             await asyncio.wait_for(playback_finished.wait(), timeout=30.0) # Timeout after 30s
+                             await asyncio.wait_for(playback_finished.wait(), timeout=45.0)
                         except asyncio.TimeoutError:
-                             logging.error(f"Timeout waiting for TTS playback to finish in guild {guild_id}. Stopping playback.")
-                             if vc.is_playing():
-                                 vc.stop()
-                             # Run check anyway, might need to disconnect
-                             await self.check_and_disconnect_if_alone(guild_id, refreshed_channel)
+                             logging.error(f"G:{guild_id} Timeout waiting for playback finish. Stopping.")
+                             if vc.is_playing(): vc.stop()
+                             # check_and_disconnect is called by after_play even on timeout stop
+                        # Clean up file only after successful play/stop
+                        try: 
+                            if os.path.exists(tts_path):
+                                 logging.debug(f"G:{guild_id} Removing TTS file: {tts_path}")
+                                 os.remove(tts_path)
+                        except OSError as e: logging.warning(f"G:{guild_id} Could not remove TTS file {tts_path}: {e}")
 
-                    except discord.ClientException as e:
-                        logging.error(f"Discord ClientException during TTS playback in guild {guild_id}: {e}. Skipping.")
-                        if vc.is_playing(): vc.stop()
-                        await self.check_and_disconnect_if_alone(guild_id, refreshed_channel)
-                    except Exception as e:
-                         logging.error(f"Unexpected error during TTS playback setup/wait in guild {guild_id}: {e}", exc_info=True)
+                    except discord.ClientException as e: 
+                         logging.error(f"G:{guild_id} ClientException during playback: {e}. Checking disconnect.")
                          if vc.is_playing(): vc.stop()
-                         await self.check_and_disconnect_if_alone(guild_id, refreshed_channel)
+                         # Don't run check_and_disconnect here, let after_play handle it if called
+                    except Exception as e:
+                         logging.error(f"G:{guild_id} Unexpected error during playback: {e}", exc_info=True)
+                         if vc.is_playing(): vc.stop()
+                         # Don't run check_and_disconnect here, let after_play handle it if called
+
+                # Mark item as processed *after* lock released
+                self.tts_queue[guild_id].task_done()
+                logging.debug(f"G:{guild_id} Marked task done for: '{tts_text[:30]}...'")
 
             except asyncio.CancelledError:
-                 logging.info(f"TTS queue processing for guild {guild_id} cancelled.")
-                 break # Exit loop if task is cancelled
+                 logging.info(f"TTS processing task for guild {guild_id} cancelled.")
+                 break # Exit loop on cancellation
             except Exception as e:
-                 logging.error(f"Unexpected error in TTS queue processing loop for guild {guild_id}: {e}", exc_info=True)
-                 # Avoid tight loop errors, add a small delay
-                 await asyncio.sleep(1)
+                 # Error likely occurred getting item from queue or early checks
+                 logging.error(f"Unexpected error in TTS queue processing loop (before playback) for guild {guild_id}: {e}", exc_info=True)
+                 # If an error occurs getting item, we might not have an item to mark done.
+                 # Check if queue still exists and potentially mark done if error happened after get()
+                 if guild_id in self.tts_queue and 'target_channel' in locals(): # Check if get() succeeded
+                      try: 
+                           self.tts_queue[guild_id].task_done()
+                           logging.warning(f"G:{guild_id} Marked task done after pre-playback error.")
+                      except ValueError: pass 
+                 await asyncio.sleep(1) # Wait briefly before next attempt
 
-        logging.info(f"TTS queue processing finished for guild {guild_id}.")
-        guild_tts_tasks.pop(guild_id, None) # Remove task entry when queue is empty
-        # Final check for disconnection if queue ended and bot might be alone
-        last_vc = guild_voice_clients.get(guild_id)
-        if last_vc and last_vc.is_connected():
-             await self.check_and_disconnect_if_alone(guild_id, last_vc.channel)
-
+        # ... (End of task cleanup) ...
+        logging.info(f"TTS processing task for guild {guild_id} has stopped.")
+        # Ensure task reference is removed
+        self.tts_processor_tasks.pop(guild_id, None)
 
     async def _get_or_connect_vc(self, guild: discord.Guild, channel: discord.VoiceChannel) -> discord.VoiceClient | None:
         """Gets the existing voice client for the guild or connects to the specified channel."""
@@ -455,31 +504,35 @@ class TTSCog(commands.Cog):
             finally:
                  reconnecting_guilds.discard(guild_id)
 
-    async def check_and_disconnect_if_alone(self, guild_id: int, channel: discord.VoiceChannel):
-        """Checks if the bot is the only member left in the channel and disconnects if so."""
-        # Add a small delay to allow state updates to propagate
-        await asyncio.sleep(1.0) 
-
-        vc = guild_voice_clients.get(guild_id)
-        # Ensure we're checking the correct channel and the bot is connected
-        if not vc or not vc.is_connected() or vc.channel != channel:
-            # logging.debug(f"Skipping disconnect check: VC not found, not connected, or in different channel ({vc.channel.id if vc else 'N/A'} vs {channel.id})")
+    async def check_and_disconnect_if_alone(self, guild_id: int, channel: discord.VoiceChannel | None, guild: discord.Guild):
+        """Checks if the bot is alone in the channel and disconnects if true."""
+        if not channel: 
+            # logging.debug("check_and_disconnect: No channel provided.")
             return
 
-        # Refresh channel members
+        vc = guild.voice_client
+        # Check if bot is connected to THIS specific channel
+        if not vc or not vc.is_connected() or vc.channel.id != channel.id:
+            # logging.debug(f"check_and_disconnect: Bot not connected or not in target channel {channel.id}")
+            return
+
+        # Refresh channel state immediately before checking members
         refreshed_channel = self.bot.get_channel(channel.id)
         if not refreshed_channel or not isinstance(refreshed_channel, discord.VoiceChannel):
-            logging.warning(f"Channel {channel.id} not found during disconnect check.")
-            # If channel doesn't exist, we should disconnect
+            logging.warning(f"Channel {channel.id} not found during disconnect check. Attempting disconnect anyway.")
             await self._safe_disconnect(vc)
             return
 
-        # Check if only the bot is left
-        if len(refreshed_channel.members) == 1 and refreshed_channel.members[0] == guild.me:
-            logging.info(f"Bot is alone in voice channel {refreshed_channel.name} ({refreshed_channel.id}). Disconnecting.")
+        # Check members *in the refreshed channel state*
+        human_members = [m for m in refreshed_channel.members if not m.bot]
+
+        if not human_members:
+            # --- Optimization: Remove grace period --- 
+            logging.info(f"Bot is alone in {refreshed_channel.name} ({refreshed_channel.id}). Disconnecting immediately.")
             await self._safe_disconnect(vc)
+            # --- End Optimization --- 
         # else:
-        #      logging.debug(f"Bot is not alone in {refreshed_channel.name}. Members: {[m.name for m in refreshed_channel.members]}")
+            # logging.debug(f"Bot not alone in {refreshed_channel.name}. Members: {[m.name for m in human_members]}")
 
     @tasks.loop(hours=1)
     async def cleanup_tts_files(self):

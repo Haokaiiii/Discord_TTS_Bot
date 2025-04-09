@@ -8,7 +8,7 @@ from pytz import timezone
 
 from utils.database import DatabaseManager
 from utils.helpers import get_preferred_name, check_channel, send_to_command_channel
-from utils.plotting import generate_periodic_chart, generate_co_occurrence_heatmap
+from utils.plotting import generate_periodic_chart, generate_co_occurrence_heatmap, generate_relationship_network_graph
 from utils.config import EXCLUDED_VOICE_CHANNEL_IDS
 
 class StatsCog(commands.Cog):
@@ -304,16 +304,16 @@ class StatsCog(commands.Cog):
 
         scheduler = AsyncIOScheduler(timezone=timezone('Australia/Sydney'))
 
-        # Schedule daily report slightly after midnight
+        # --- Periodic Stat Reports ---
         scheduler.add_job(self.send_periodic_report, CronTrigger(hour=0, minute=5), args=['daily'], id='daily_report', replace_existing=True)
-        # Schedule weekly report early Monday morning
         scheduler.add_job(self.send_periodic_report, CronTrigger(day_of_week='mon', hour=0, minute=10), args=['weekly'], id='weekly_report', replace_existing=True)
-        # Schedule monthly report on the 1st day of the month
         scheduler.add_job(self.send_periodic_report, CronTrigger(day=1, hour=0, minute=15), args=['monthly'], id='monthly_report', replace_existing=True)
-        # Schedule yearly report on Jan 1st
         scheduler.add_job(self.send_periodic_report, CronTrigger(month=1, day=1, hour=0, minute=20), args=['yearly'], id='yearly_report', replace_existing=True)
+        
+        # --- Daily Co-occurrence Heatmap Report ---
+        scheduler.add_job(self.send_daily_heatmap_report, CronTrigger(hour=0, minute=25), id='daily_heatmap', replace_existing=True)
 
-        # Add task to reset periodic stats
+        # --- Reset Periodic Stats --- (Run shortly after midnight)
         scheduler.add_job(self.reset_periodic_stats, CronTrigger(hour=0, minute=1), args=['daily'], id='reset_daily', replace_existing=True)
         scheduler.add_job(self.reset_periodic_stats, CronTrigger(day_of_week='mon', hour=0, minute=1), args=['weekly'], id='reset_weekly', replace_existing=True)
         scheduler.add_job(self.reset_periodic_stats, CronTrigger(day=1, hour=0, minute=1), args=['monthly'], id='reset_monthly', replace_existing=True)
@@ -401,6 +401,48 @@ class StatsCog(commands.Cog):
                     content=f"生成 {period.capitalize()} 语音活动图表时出错。"
                 )
 
+    async def send_daily_heatmap_report(self):
+        """Generates and sends the daily co-occurrence heatmap report to each guild."""
+        logging.info("Generating Daily Co-occurrence Heatmap reports for all guilds.")
+        await self.bot.wait_until_ready() # Ensure bot is connected
+
+        # Make sure stats are saved before generating report
+        await self.save_stats()
+        await asyncio.sleep(2) # Small delay to ensure save completes
+
+        # Consider reloading co-occurrence stats from DB for consistency?
+        # Using in-memory stats for now.
+
+        for guild in self.bot.guilds:
+            guild_id = guild.id
+            logging.info(f"Generating daily heatmap report for guild {guild.name} ({guild_id})")
+
+            guild_co_occurrence = self.co_occurrence_stats.get(guild_id)
+            if not guild_co_occurrence:
+                logging.info(f"No co-occurrence data for guild {guild_id}. Skipping daily heatmap report.")
+                # Optionally send a message? 
+                # await send_to_command_channel(self.bot, guild_id, content="每日关系热力图：无数据可生成。")
+                continue
+
+            heatmap_buffer = await generate_co_occurrence_heatmap(guild, guild_co_occurrence, relative=False)
+
+            if heatmap_buffer:
+                report_title = f"{guild.name} 每日成员共同在线时长热力图 (小时)"
+                embed = discord.Embed(title=report_title, color=discord.Color.red())
+                embed.set_image(url="attachment://daily_co_occurrence_abs.png")
+                embed.timestamp = datetime.now()
+                embed.set_footer(text="此报告每日自动生成")
+
+                file = discord.File(heatmap_buffer, filename="daily_co_occurrence_abs.png")
+                await send_to_command_channel(self.bot, guild_id, embed=embed, file=file)
+                logging.info(f"Sent daily heatmap report for guild {guild_id}")
+            else:
+                logging.error(f"Failed to generate daily heatmap for guild {guild_id}")
+                await send_to_command_channel(
+                    self.bot, guild_id,
+                    content="生成每日关系热力图时出错。"
+                )
+
     # --- Commands --- 
 
     @commands.command(name='stats')
@@ -409,7 +451,7 @@ class StatsCog(commands.Cog):
         """显示指定时间段的语音在线时长统计 (daily, weekly, monthly, yearly, total)。"""
         valid_periods = ['daily', 'weekly', 'monthly', 'yearly', 'total']
         if period.lower() not in valid_periods:
-            await ctx.send(f"无效的时间段。请使用以下之一: {", ".join(valid_periods)}", delete_after=10)
+            await ctx.send(f"无效的时间段。请使用以下之一: {{ ", ".join(valid_periods) }} ", delete_after=10)
             return
 
         period = period.lower()
@@ -457,10 +499,10 @@ class StatsCog(commands.Cog):
         except discord.HTTPException:
             pass # Ignore if message was deleted or reaction couldn't be added
 
-    @commands.command(name='relationships', aliases=['rel'])
+    @commands.command(name='relationships', aliases=['rel', 'network'])
     @check_channel()
     async def show_relationships(self, ctx: commands.Context):
-        """显示成员共同在线时长的热力图 (绝对时长)。"""
+        """显示成员关系网络图 (基于共同在线时长)。包含总时长Top10和本周活跃Top10用户。"""
         guild = ctx.guild
         if not guild:
             await ctx.send("此命令只能在服务器内使用。")
@@ -469,55 +511,28 @@ class StatsCog(commands.Cog):
         await ctx.message.add_reaction('⏳')
 
         guild_co_occurrence = self.co_occurrence_stats.get(guild.id)
+        guild_voice_stats = self.voice_stats.get(guild.id)
+
         if not guild_co_occurrence:
             await ctx.send("尚未记录此服务器的共同在线数据。")
             await ctx.message.remove_reaction('⏳', self.bot.user)
             return
+        
+        # Get weekly stats, default to empty dict if no stats for guild
+        weekly_stats = {mid: stats.get('weekly', 0) for mid, stats in (guild_voice_stats or {}).items()}
 
-        heatmap_buffer = await generate_co_occurrence_heatmap(guild, guild_co_occurrence, relative=False)
+        # Call the graph function with both datasets
+        graph_buffer = await generate_relationship_network_graph(guild, guild_co_occurrence, weekly_stats)
 
-        if heatmap_buffer:
-            embed = discord.Embed(title=f"{guild.name} 成员共同在线时长 (小时)", color=discord.Color.purple())
-            embed.set_image(url="attachment://co_occurrence_abs.png")
+        if graph_buffer:
+            embed = discord.Embed(title=f"{guild.name} 成员关系网络图", color=discord.Color.blue())
+            embed.description = "包含总时长Top10和本周活跃Top10用户。连线粗细/深浅代表成员共同在线时长。"
+            embed.set_image(url="attachment://relationship_network.png")
             embed.timestamp = datetime.now()
-            file = discord.File(heatmap_buffer, filename="co_occurrence_abs.png")
+            file = discord.File(graph_buffer, filename="relationship_network.png")
             await ctx.send(embed=embed, file=file)
         else:
-            await ctx.send("生成关系热力图时出错或没有足够的数据。")
-
-        try:
-             await ctx.message.remove_reaction('⏳', self.bot.user)
-             await ctx.message.add_reaction('✅')
-        except discord.HTTPException:
-            pass
-
-    @commands.command(name='relationships_relative', aliases=['rel_rel'])
-    @check_channel()
-    async def show_relationships_relative(self, ctx: commands.Context):
-        """显示成员共同在线时间占个人总共同在线时间的比例 (%) 的热力图。"""
-        guild = ctx.guild
-        if not guild:
-            await ctx.send("此命令只能在服务器内使用。")
-            return
-
-        await ctx.message.add_reaction('⏳')
-
-        guild_co_occurrence = self.co_occurrence_stats.get(guild.id)
-        if not guild_co_occurrence:
-            await ctx.send("尚未记录此服务器的共同在线数据。")
-            await ctx.message.remove_reaction('⏳', self.bot.user)
-            return
-
-        heatmap_buffer = await generate_co_occurrence_heatmap(guild, guild_co_occurrence, relative=True)
-
-        if heatmap_buffer:
-            embed = discord.Embed(title=f"{guild.name} 成员共同在线时间比例 (%)", color=discord.Color.orange())
-            embed.set_image(url="attachment://co_occurrence_rel.png")
-            embed.timestamp = datetime.now()
-            file = discord.File(heatmap_buffer, filename="co_occurrence_rel.png")
-            await ctx.send(embed=embed, file=file)
-        else:
-            await ctx.send("生成相对关系热力图时出错或没有足够的数据。")
+            await ctx.send("生成关系网络图时出错或没有足够的数据/用户满足条件。")
 
         try:
              await ctx.message.remove_reaction('⏳', self.bot.user)

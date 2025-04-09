@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
 # Install Python dependencies
 COPY requirements.txt .
 # Consider adding --prefer-binary for faster builds if wheels are available
+# networkx might need gcc/dev headers, ensure they are installed in builder stage
 RUN pip wheel --no-cache-dir --wheel-dir /app/wheels -r requirements.txt
 
 # Final stage
@@ -53,9 +54,13 @@ RUN pip install --no-cache-dir /wheels/*
 COPY main.py ./
 COPY utils/ ./utils/
 COPY cogs/ ./cogs/
-COPY .env ./
-# Note: Copying .env into the image is generally NOT recommended for production.
-# Consider using Docker secrets or environment variables injected at runtime.
+# COPY .env ./
+# >>> WARNING <<<: Copying the .env file directly into the image is a security risk!
+# Secrets like your bot token and database URI should ideally be injected at runtime
+# using Docker secrets, Kubernetes secrets, or environment variables passed via 
+# `docker run -e VAR=value ...` or a docker-compose.yml file.
+# Only uncomment the `COPY .env ./` line above if you understand the risks 
+# and are in a controlled development environment.
 
 # Create necessary directories and set permissions
 # Ensure these match the paths used in config.py (if different from WORKDIR)
