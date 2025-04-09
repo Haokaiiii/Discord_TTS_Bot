@@ -229,7 +229,7 @@ async def generate_periodic_chart(guild: discord.Guild, voice_stats_data: dict, 
 
 async def generate_relationship_network_graph(guild: discord.Guild, co_occurrence_data: dict, weekly_stats: dict) -> io.BytesIO | None:
     """Generates a network graph visualizing co-occurrence relationships 
-       for top 10 by co-occurrence and top 10 by weekly activity.
+       for top 10 by co-occurrence and top 10 distinct weekly active users.
 
     Args:
         guild (discord.Guild): The guild for which to generate the graph.
@@ -257,13 +257,17 @@ async def generate_relationship_network_graph(guild: discord.Guild, co_occurrenc
     top_co_occurrence_users = {uid for uid, _ in total_co_occurrence_per_user.most_common(10)}
     logging.debug(f"Top 10 Co-occurrence Users (IDs): {top_co_occurrence_users}")
 
-    # Get top 10 by weekly activity (ensure weekly_stats is not None)
+    # Get top 10 weekly active users, excluding those already in the top co-occurrence list
     if weekly_stats is None: weekly_stats = {}
-    top_weekly_active_users = {uid for uid, _ in sorted(weekly_stats.items(), key=lambda item: item[1], reverse=True)[:10]}
-    logging.debug(f"Top 10 Weekly Active Users (IDs): {top_weekly_active_users}")
+    # Sort all weekly users first
+    sorted_weekly_users = sorted(weekly_stats.items(), key=lambda item: item[1], reverse=True)
+    # Filter out those already selected and take top 10 of the remainder
+    distinct_top_weekly_users = {uid for uid, _ in 
+                                 [item for item in sorted_weekly_users if item[0] not in top_co_occurrence_users][:10]}
+    logging.debug(f"Top 10 Distinct Weekly Active Users (IDs): {distinct_top_weekly_users}")
 
-    # Combine the sets and ensure minimum node count
-    selected_user_ids = top_co_occurrence_users.union(top_weekly_active_users)
+    # Combine the sets 
+    selected_user_ids = top_co_occurrence_users.union(distinct_top_weekly_users)
 
     if len(selected_user_ids) < 2:
         logging.info(f"Not enough users selected ({len(selected_user_ids)}) based on criteria for guild {guild.id}. No graph generated.")
@@ -272,19 +276,18 @@ async def generate_relationship_network_graph(guild: discord.Guild, co_occurrenc
 
     # --- Build Subgraph --- 
     try:
-        await guild.chunk() # Ensure member cache is populated
+        await guild.chunk()
         members_map = {m.id: m for m in guild.members}
     except discord.errors.ClientException:
-        logging.warning(f"Could not chunk guild {guild.id}, member names might be incomplete for network graph.")
+        logging.warning(f"Could not chunk guild {guild.id}, member names incomplete.")
         members_map = {m.id: m for m in guild.members}
 
     G = nx.Graph()
     edges_data = []
     min_duration = float('inf')
     max_duration = 0.0
-
-    # Add nodes for selected users
     nodes_added = set()
+    
     for user_id in selected_user_ids:
         member = members_map.get(user_id)
         if member:
@@ -292,75 +295,73 @@ async def generate_relationship_network_graph(guild: discord.Guild, co_occurrenc
             G.add_node(user_id, label=name)
             nodes_added.add(user_id)
         else:
-             logging.warning(f"Could not find member info for selected user ID {user_id} in guild {guild.id}. Skipping node.")
+             logging.warning(f"Could not find member info for selected user ID {user_id}. Skipping.")
     
-    if G.number_of_nodes() < 2: # Check again after potential member fetch failures
-        logging.info(f"Not enough valid nodes ({G.number_of_nodes()}) after fetching member info for guild {guild.id}. No graph generated.")
+    if G.number_of_nodes() < 2:
+        logging.info(f"Not enough valid nodes ({G.number_of_nodes()}) after fetch. No graph.")
         return None
 
-    # Add edges between selected users if they have valid co-occurrence
     for m1_id in nodes_added:
         for m2_id in nodes_added:
-            if m1_id >= m2_id: continue # Avoid self-loops and duplicate pairs
-            pair = (m1_id, m2_id) # Already sorted because nodes_added is iterated in order? Ensure anyway.
+            if m1_id >= m2_id: continue
+            pair = tuple(sorted((m1_id, m2_id)))
             if pair in valid_pairs:
-                 duration_seconds = co_occurrence_data.get(pair, 0.0) # Should exist if in valid_pairs
-                 if duration_seconds > 0: # Should be true if >= 60s filter passed
+                 duration_seconds = co_occurrence_data.get(pair, 0.0)
+                 if duration_seconds > 0:
                      G.add_edge(m1_id, m2_id, weight=duration_seconds)
                      edges_data.append(duration_seconds)
                      min_duration = min(min_duration, duration_seconds)
                      max_duration = max(max_duration, duration_seconds)
     
     if G.number_of_edges() == 0:
-         logging.info(f"Selected users for guild {guild.id} have no co-occurrence edges between them. No graph generated.")
-         # Optionally, draw just the nodes? For now, return None.
+         logging.info(f"Selected users for guild {guild.id} have no co-occurrence edges. No graph.")
          return None
 
     # --- Graph Drawing --- 
-    plt.figure(figsize=(20, 20)) # Adjusted size back slightly
+    plt.figure(figsize=(20, 20))
     try:
-        # Layout algorithm - spring layout with strong separation
+        # Layout algorithm - spring layout with stronger separation
         node_count = G.number_of_nodes()
-        k_value = 4.0 / np.sqrt(node_count) if node_count > 0 else 1.0 # Keep strong separation
-        pos = nx.spring_layout(G, k=k_value, iterations=200, seed=42)
+        # Increase k significantly more
+        k_value = 6.0 / np.sqrt(node_count) if node_count > 0 else 1.0 
+        pos = nx.spring_layout(G, k=k_value, iterations=250, seed=42) # Increased iterations
         
-        # Assign unique colors to nodes
-        colors = plt.get_cmap('tab20').colors # Colormap with 20 distinct colors
+        # Assign unique colors to nodes (remains same)
+        colors = plt.get_cmap('tab20').colors 
         node_color_map = {node: colors[i % len(colors)] for i, node in enumerate(G.nodes())}
         node_colors = [node_color_map[node] for node in G.nodes()]
 
-        # Node size based on degree within the *subgraph*
-        degrees = [G.degree(n) for n in G.nodes()]
-        min_degree, max_degree = (min(degrees), max(degrees)) if degrees else (1, 1)
-        node_sizes = [600 + (d - min_degree) / max(1, max_degree - min_degree) * 2000 for d in degrees]
+        # Node shape and fixed size (reduced slightly)
+        node_shape = 's' # Square marker
+        fixed_node_size = 1000 # Reduced size
 
-        # Edge width/alpha scaled more aggressively for emphasis
-        if max_duration <= min_duration: # Avoid division by zero/invalid range
+        # Edge width/alpha scaling (make weakest edges fainter)
+        if max_duration <= min_duration: 
              norm_weights = [0.5] * G.number_of_edges()
         else:
-             # Scale weights logarithmically? Or just power scale?
-             # Power scale: Emphasizes higher values more
              power = 1.5 
              norm_weights = [((d['weight'] - min_duration) / (max_duration - min_duration)) ** power 
                            for u, v, d in G.edges(data=True)]
-        
-        # Adjust width/alpha based on normalized weights
-        edge_widths = [0.5 + w * 5.0 for w in norm_weights] # Thinner base, larger max
-        edge_alphas = [0.1 + w * 0.7 for w in norm_weights] # Fainter base, stronger max
+        edge_widths = [0.5 + w * 5.0 for w in norm_weights] 
+        edge_alphas = [0.05 + w * 0.65 for w in norm_weights] # Make base fainter, scale less aggressively
 
-        # Draw nodes with unique colors
-        nx.draw_networkx_nodes(G, pos, node_size=node_sizes, node_color=node_colors, alpha=0.9)
+        # Draw nodes with square shape and fixed size
+        nx.draw_networkx_nodes(G, pos, 
+                               node_size=fixed_node_size, 
+                               node_color=node_colors, 
+                               node_shape=node_shape, 
+                               alpha=0.9)
 
-        # Draw edges
-        nx.draw_networkx_edges(G, pos, width=edge_widths, alpha=edge_alphas, edge_color='darkgrey') # Darker edges
+        # Draw edges (remains same)
+        nx.draw_networkx_edges(G, pos, width=edge_widths, alpha=edge_alphas, edge_color='darkgrey')
 
-        # Draw labels
+        # Draw labels (remains same, with bbox)
         labels = nx.get_node_attributes(G, 'label')
         nx.draw_networkx_labels(G, pos, labels=labels, font_size=9, 
                                font_family=font_prop.get_name() if font_prop else 'sans-serif',
                                bbox=dict(facecolor='white', alpha=0.6, edgecolor='none', boxstyle='round,pad=0.2'))
 
-        plt.title(f'{guild.name} - 成员关系网络图 (Top 10 Co-Occur + Top 10 Weekly)', fontsize=16, fontproperties=font_prop if font_prop else None)
+        plt.title(f'{guild.name} - 成员关系网络图 (Top 10 Co + Top 10 Wkly)', fontsize=16, fontproperties=font_prop if font_prop else None)
         plt.axis('off')
 
         buf = io.BytesIO()
