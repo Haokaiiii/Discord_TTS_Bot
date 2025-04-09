@@ -1442,30 +1442,30 @@ async def check_voice_connections():
 async def cleanup_voice_client(guild_id: int):
     """清理语音客户端的所有状态"""
     try:
-        logging.info(f"开始清理语音客户端，Guild ID: {guild_id}")
+        # 获取并清理全局字典中的引用
         voice_client = guild_voice_clients.pop(guild_id, None)
-
+        
         if voice_client:
             try:
+                # 强制断开连接
                 if voice_client.is_connected():
-                    logging.info(f"正在断开与语音频道的连接，Guild ID: {guild_id}")
                     await voice_client.disconnect(force=True)
             except Exception as e:
                 logging.error(f"断开语音连接时发生错误: {e}")
-
+            
+            # 确保清理所有相关资源
             try:
                 voice_client.cleanup()
-            except Exception as e:
-                logging.error(f"清理语音客户端时发生错误: {e}")
+            except:
+                pass
 
-        # 清理所有相关的语音连接
+        # 使用 bot.voice_clients 而不是 guild.voice_clients
         for vc in bot.voice_clients:
             if vc.guild.id == guild_id:
                 try:
-                    logging.info(f"正在断开其他语音连接，Guild ID: {guild_id}")
                     await vc.disconnect(force=True)
-                except Exception as e:
-                    logging.error(f"断开其他语音连接时发生错误: {e}")
+                except:
+                    pass
 
         logging.info("确认已与语音频道断开。")
     except Exception as e:
