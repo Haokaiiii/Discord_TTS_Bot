@@ -10,7 +10,7 @@ import discord
 import networkx as nx
 import matplotlib.cm as cm # Import colormap
 import matplotlib.colors as mcolors # For distinct colors
-from collections import Counter
+from collections import Counter, defaultdict
 
 from utils.config import FONT_PATH
 from utils.helpers import get_preferred_name
@@ -206,7 +206,8 @@ async def generate_periodic_chart(guild: discord.Guild, voice_stats_data: dict, 
 
     plt.figure(figsize=(12, max(6, len(df) * 0.4)))
     try:
-        barplot = sns.barplot(x='DurationHours', y='Member', data=df, palette="viridis", orient='h')
+        # Assign `y` to `hue` and disable legend to fix FutureWarning
+        barplot = sns.barplot(x='DurationHours', y='Member', hue='Member', data=df, palette="viridis", orient='h', legend=False)
 
         # Add labels to bars
         for container in barplot.containers:

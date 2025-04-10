@@ -292,7 +292,7 @@ class TTSCog(commands.Cog):
 
     def _blocking_gtts_call(self, text: str, output_path: str):
         """The actual blocking gTTS call. DO NOT run this directly in the main event loop."""
-        tts = gTTS(text=text, lang='zh-cn')
+        tts = gTTS(text=text, lang='zh-CN')
         tts.save(output_path)
 
     async def process_guild_tts_queue(self, guild_id: int):

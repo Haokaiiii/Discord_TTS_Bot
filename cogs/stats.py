@@ -119,7 +119,9 @@ class StatsCog(commands.Cog):
 
                     if overlap_duration > 0:
                         pair = tuple(sorted((member_id, other_member_id)))
-                        self.co_occurrence_stats[guild_id][pair] += overlap_duration
+                        # Use .get() for safer update, though defaultdict should handle it
+                        current_co_occurrence = self.co_occurrence_stats[guild_id].get(pair, 0.0)
+                        self.co_occurrence_stats[guild_id][pair] = current_co_occurrence + overlap_duration
                         logging.debug(f"Updated co-occurrence for pair {pair} by {overlap_duration:.2f}s in guild {guild_id}. Total: {self.co_occurrence_stats[guild_id][pair]:.2f}s")
                     else:
                          logging.debug(f"No overlap duration calculated for pair ({member_id}, {other_member_id}) during leave event.")
@@ -214,11 +216,18 @@ class StatsCog(commands.Cog):
                 else:
                     self._update_stats(guild_id, member_id, duration_seconds)
                     logging.debug(f"Recorded {duration_seconds:.2f}s for member {member_id} leaving channel {before_channel_id}")
-                    self._update_co_occurrence(guild_id, before_channel_id, member_id, 'leave')
+                    # Use a try-except block for extra safety around the KeyError source
+                    try:
+                        self._update_co_occurrence(guild_id, before_channel_id, member_id, 'leave')
+                    except KeyError as e:
+                        logging.error(f"KeyError during co-occurrence update (leave) for {member_id} in channel {before_channel_id}: {e}", exc_info=True)
             else:
                 logging.warning(f"Member {member_id} left voice channel {before_channel_id} but join time was not tracked.")
                 # Still try to update co-occurrence state if possible, might clean up stale entries
-                self._update_co_occurrence(guild_id, before_channel_id, member_id, 'leave')
+                try:
+                    self._update_co_occurrence(guild_id, before_channel_id, member_id, 'leave')
+                except KeyError as e:
+                    logging.error(f"KeyError during co-occurrence update (leave, untracked join) for {member_id} in channel {before_channel_id}: {e}", exc_info=True)
 
 
         # Case 3: Switching voice channels (from tracked to tracked)
@@ -235,11 +244,17 @@ class StatsCog(commands.Cog):
                     self._update_stats(guild_id, member_id, duration_seconds)
                     logging.debug(f"Recorded {duration_seconds:.2f}s for member {member_id} leaving channel {before_channel_id} during switch")
                     # Update co-occurrence for the channel they left
-                    self._update_co_occurrence(guild_id, before_channel_id, member_id, 'leave')
+                    try:
+                        self._update_co_occurrence(guild_id, before_channel_id, member_id, 'leave')
+                    except KeyError as e:
+                         logging.error(f"KeyError during co-occurrence update (switch-leave) for {member_id} in channel {before_channel_id}: {e}", exc_info=True)
             else:
                  logging.warning(f"Member {member_id} switched channels, but join time was not tracked for channel {before_channel_id}. Handling leave part of switch.")
                  # Still try to update co-occurrence state for the channel they left
-                 self._update_co_occurrence(guild_id, before_channel_id, member_id, 'leave')
+                 try:
+                     self._update_co_occurrence(guild_id, before_channel_id, member_id, 'leave')
+                 except KeyError as e:
+                     logging.error(f"KeyError during co-occurrence update (switch-leave, untracked join) for {member_id} in channel {before_channel_id}: {e}", exc_info=True)
 
             # Reset join time for the new channel
             self.voice_activity[guild_id][member_id] = now
