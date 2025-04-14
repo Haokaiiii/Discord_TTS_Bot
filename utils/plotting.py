@@ -1,6 +1,14 @@
 import logging
 import os
 import io
+import matplotlib
+# Set memory limit for matplotlib to prevent crashes
+matplotlib.rcParams['agg.path.chunksize'] = 10000
+# Set a reasonable figure size limit
+matplotlib.rcParams['figure.max_open_warning'] = 40
+# Reduce default DPI for better memory usage
+matplotlib.rcParams['figure.dpi'] = 100
+
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import seaborn as sns
@@ -60,16 +68,34 @@ def create_heatmap(data: pd.DataFrame, title: str, color_map="viridis", annot=Tr
     Returns:
         io.BytesIO | None: A BytesIO object containing the PNG image data, or None on error.
     """
-    if data.empty:
-        logging.warning(f"Attempted to generate heatmap '{title}' with empty data.")
-        return None
-
-    # Adjust figure size dynamically
-    figsize_x = max(10, len(data.columns) * 0.8)
-    figsize_y = max(8, len(data.index) * 0.6)
-    
-    logging.debug(f"[Create Heatmap - {title}] Starting plot generation...")
     try:
+        # Defensive type checking
+        if not isinstance(data, pd.DataFrame):
+            logging.error(f"Invalid data type for heatmap '{title}': {type(data)}. Expected pandas DataFrame.")
+            return None
+            
+        # Check if data is empty 
+        if data.empty:
+            logging.warning(f"Attempted to generate heatmap '{title}' with empty data.")
+            return None
+            
+        # Check for NaN and inf values
+        if data.isnull().values.any() or np.isinf(data.values).any():
+            logging.warning(f"DataFrame for heatmap '{title}' contains NaN or inf values. Attempting to fix.")
+            data = data.fillna(0).replace([np.inf, -np.inf], 0)
+
+        # Adjust figure size dynamically - with size limits
+        rows, cols = data.shape
+        max_dimension = 40  # Set a reasonable limit to prevent memory issues
+        if rows > max_dimension or cols > max_dimension:
+            logging.warning(f"DataFrame for heatmap '{title}' is very large ({rows}x{cols}). Using subset.")
+            data = data.iloc[:max_dimension, :max_dimension]
+            rows, cols = data.shape
+            
+        figsize_x = max(10, min(30, cols * 0.8))  # Cap at 30
+        figsize_y = max(8, min(25, rows * 0.6))   # Cap at 25
+        
+        logging.debug(f"[Create Heatmap - {title}] Starting plot generation...")
         # Use plt.figure within the try block
         logging.debug(f"[Create Heatmap - {title}] Creating figure...")
         plt.figure(figsize=(figsize_x, figsize_y))
@@ -127,8 +153,11 @@ def create_heatmap(data: pd.DataFrame, title: str, color_map="viridis", annot=Tr
         logging.debug(f"[Create Heatmap - {title}] Caught exception during generation.")
         return None
     finally:
-        logging.debug(f"[Create Heatmap - {title}] Closing plot figure.")
-        plt.close() # Close the plot to free memory
+        try:
+            logging.debug(f"[Create Heatmap - {title}] Closing plot figure.")
+            plt.close() # Close the plot to free memory
+        except Exception as e:
+            logging.warning(f"Error closing plot figure for '{title}': {e}")
 
 async def generate_co_occurrence_heatmap(guild: discord.Guild, co_occurrence_data: dict, relative: bool = False) -> io.BytesIO | None:
     """Generates a co-occurrence heatmap (absolute or relative) for a guild.
@@ -246,11 +275,40 @@ async def generate_co_occurrence_heatmap(guild: discord.Guild, co_occurrence_dat
     df = pd.DataFrame(matrix, index=active_member_names_list, columns=active_member_names_list)
     logging.debug("[Generate Heatmap] DataFrame created. Shape: {}".format(df.shape))
 
+    # Reduce dataset size if it's too large
+    max_members_for_heatmap = 40
+    if len(df) > max_members_for_heatmap:
+        logging.warning(f"[Generate Heatmap] Matrix too large ({len(df)}x{len(df)}). Limiting to top {max_members_for_heatmap} members.")
+        # Sum the values in each row to find the most active members
+        row_sums = df.sum(axis=1)
+        top_members = row_sums.nlargest(max_members_for_heatmap).index
+        df = df.loc[top_members, top_members]
+        logging.info(f"[Generate Heatmap] Reduced matrix size to {len(df)}x{len(df)}")
+
+    # Determine if we should annotate based on matrix size
+    should_annotate = len(df) <= 25  # Only annotate if 25 or fewer members
+        
     # Heatmap function now handles empty check
     logging.info("[Generate Heatmap] Calling create_heatmap function...")
-    heatmap_result = create_heatmap(df, title, color_map=color_map, fmt=fmt, annot=True if len(df) <= 20 else False)
-    logging.info("[Generate Heatmap] create_heatmap call finished.")
-    return heatmap_result
+    try:
+        # Additional logging and type validation
+        logging.debug(f"[Generate Heatmap] DataFrame shape: {df.shape}, type: {type(df)}")
+        if not isinstance(df, pd.DataFrame):
+            logging.error(f"[Generate Heatmap] Expected DataFrame but got {type(df)}. Cannot create heatmap.")
+            return None
+        
+        # Check for NaN values and attempt to sanitize
+        if df.isnull().values.any():
+            logging.warning("[Generate Heatmap] Found NaN values in DataFrame, filling with zeros")
+            df = df.fillna(0)
+            
+        # Call the heatmap function with defensive wrapper
+        heatmap_result = create_heatmap(df, title, color_map=color_map, fmt=fmt, annot=should_annotate)
+        logging.info("[Generate Heatmap] create_heatmap call finished.")
+        return heatmap_result
+    except Exception as e:
+        logging.error(f"[Generate Heatmap] Error calling create_heatmap: {e}", exc_info=True)
+        return None
 
 async def generate_periodic_chart(guild: discord.Guild, voice_stats_data: dict, period: str) -> io.BytesIO | None:
     """Generates a bar chart for voice activity over a specific period.
