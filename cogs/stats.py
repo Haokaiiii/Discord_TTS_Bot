@@ -605,7 +605,7 @@ class StatsCog(commands.Cog):
         except discord.HTTPException:
             pass
 
-    @commands.command(name='heatmap', aliases=['heat', 'matrix'])
+    @commands.command(name='heatmap', aliases=['heat', 'matrix'], brief="显示成员共同在线时长热力图 (模式: abs/rel/both)。")
     @check_channel()
     async def show_heatmap(self, ctx: commands.Context, mode: str = 'absolute'):
         """显示成员共同在线时长热力图。
