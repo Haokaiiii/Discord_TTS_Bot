@@ -498,13 +498,53 @@ async def generate_relationship_network_graph(guild: discord.Guild, co_occurrenc
     try:
         plt.figure(figsize=(fig_size, fig_size))
 
-        # Layout calculation (remains the same)
-        initial_pos = nx.circular_layout(G, scale=2.0)
-        k_value = 15.0 / np.sqrt(node_count) if node_count > 0 else 2.0
-        pos = nx.spring_layout(G, k=k_value, iterations=800, seed=42, pos=initial_pos, weight=None)
-        scaling_factor = 1.3
-        for node in pos:
-            pos[node] = tuple(coord * scaling_factor for coord in pos[node])
+        # Improved layout calculation to prevent overlapping
+        logging.debug(f"[Network Graph] Calculating layout for {node_count} nodes")
+        
+        # Step 1: Start with a circular layout to ensure initial separation
+        initial_pos = nx.circular_layout(G, scale=3.0)  # Increased scale from 2.0 to 3.0
+        
+        # Step 2: Apply spring layout with more iterations and higher repulsion
+        k_value = 25.0 / np.sqrt(node_count) if node_count > 0 else 5.0  # Increased from 15.0 to 25.0
+        pos = nx.spring_layout(G, k=k_value, iterations=1000, seed=42, pos=initial_pos, weight='weight')
+        
+        # Step 3: Enhance separation by applying scaling
+        scaling_factor = 1.6  # Increased from 1.3 to 1.6
+        pos = {node: (coords[0] * scaling_factor, coords[1] * scaling_factor) for node, coords in pos.items()}
+        
+        # Step 4: Add jitter to any nodes that are too close
+        min_distance = 0.2  # Minimum distance between nodes
+        
+        # Perform multiple passes to separate nodes that are too close
+        for _ in range(3):
+            moved = False
+            # Check each pair of nodes
+            nodes = list(pos.keys())
+            for i, n1 in enumerate(nodes):
+                for n2 in nodes[i+1:]:
+                    # Calculate distance
+                    x1, y1 = pos[n1]
+                    x2, y2 = pos[n2]
+                    dx, dy = x2 - x1, y2 - y1
+                    dist = np.sqrt(dx*dx + dy*dy)
+                    
+                    # If nodes are too close, move them apart
+                    if dist < min_distance:
+                        moved = True
+                        # Unit vector of the displacement
+                        if dist > 0:
+                            dx, dy = dx/dist, dy/dist
+                        else:  # If nodes are exactly on top of each other
+                            dx, dy = np.random.uniform(-1, 1, 2)
+                            dx, dy = dx/np.sqrt(dx*dx + dy*dy), dy/np.sqrt(dx*dx + dy*dy)
+                        
+                        # Move nodes in opposite directions
+                        pushback = (min_distance - dist) * 0.5
+                        pos[n1] = (x1 - dx * pushback, y1 - dy * pushback)
+                        pos[n2] = (x2 + dx * pushback, y2 + dy * pushback)
+            
+            if not moved:
+                break
         
         # Colors and node attributes (remains the same)
         colors = plt.get_cmap('tab20').colors 
@@ -539,16 +579,27 @@ async def generate_relationship_network_graph(guild: discord.Guild, co_occurrenc
 
             # Draw labels with improved spacing and font size
             labels = nx.get_node_attributes(G, 'label')
-            label_pos = {node: (coords[0], coords[1] + 0.07) for node, coords in pos.items()}
-            font_size = max(7, 11 - (node_count * 0.2))
+            
+            # Improve label positioning with better offsets to prevent overlap with nodes
+            # Calculate label positions based on node positions with more space
+            label_pos = {}
+            for node, (x, y) in pos.items():
+                # Reduce the offset distance to keep labels closer to nodes
+                angle = np.random.uniform(0, 2*np.pi)
+                offset_x = 0.08 * np.cos(angle)  # Reduced from 0.12
+                offset_y = 0.10 * np.sin(angle)  # Reduced from 0.18
+                label_pos[node] = (x + offset_x, y + offset_y)
+            
+            font_size = max(8, 12 - (node_count * 0.15))  # Slightly increased font size
             
             # Safely add labels with fallback for problematic characters
             try:
                 nx.draw_networkx_labels(G, label_pos, labels=labels, font_size=font_size, 
                                        font_family=font_prop.get_name() if font_prop else 'sans-serif',
                                        bbox=dict(facecolor='white', alpha=0.9, edgecolor='lightgrey', 
-                                                boxstyle='round,pad=0.4'),
-                                       verticalalignment='bottom')
+                                                boxstyle='round,pad=0.3'),  # Reduced padding
+                                       verticalalignment='center',
+                                       horizontalalignment='center')
             except Exception as label_error:
                 logging.warning(f"Error drawing network labels with formatting: {label_error}")
                 try:
@@ -558,20 +609,39 @@ async def generate_relationship_network_graph(guild: discord.Guild, co_occurrenc
 
         plt.title(f'{guild.name} - 成员关系网络图 (Top 10 Co + Top 10 Wkly)', fontsize=16, fontproperties=font_prop if font_prop else None)
         plt.axis('off')
-        plt.xlim(-1.5, 1.5)
-        plt.ylim(-1.5, 1.5)
+        
+        # Calculate axis limits dynamically based on node positions
+        all_xs = [x for x, y in pos.values()]
+        all_ys = [y for x, y in pos.values()]
+        
+        if all_xs and all_ys:  # Make sure we have data
+            min_x, max_x = min(all_xs), max(all_xs)
+            min_y, max_y = min(all_ys), max(all_ys)
+            
+            # Add padding (15% on each side) - reduced from 20%
+            x_padding = (max_x - min_x) * 0.15
+            y_padding = (max_y - min_y) * 0.15
+            
+            # Set limits with padding
+            plt.xlim(min_x - x_padding, max_x + x_padding)
+            plt.ylim(min_y - y_padding, max_y + y_padding)
+        else:
+            # Fallback to default limits if no position data
+            plt.xlim(-2.0, 2.0)
+            plt.ylim(-2.0, 2.0)
 
         buf = io.BytesIO()
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                plt.savefig(buf, format='png', dpi=180, bbox_inches='tight')
+                # Higher DPI for better quality
+                plt.savefig(buf, format='png', dpi=300, bbox_inches='tight')
         except Exception as save_error:
             logging.warning(f"Error saving relationship graph with bbox_inches='tight', trying without: {save_error}")
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
-                    plt.savefig(buf, format='png', dpi=180)
+                    plt.savefig(buf, format='png', dpi=240)  # Lower DPI as fallback
             except Exception as e:
                 logging.error(f"All attempts to save relationship graph failed: {e}")
                 return None

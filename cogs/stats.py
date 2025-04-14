@@ -454,20 +454,44 @@ class StatsCog(commands.Cog):
                         # await send_to_command_channel(self.bot, guild_id, content="每日关系热力图：无数据可生成。")
                         continue
 
-                    heatmap_buffer = await generate_co_occurrence_heatmap(guild, guild_co_occurrence, relative=False)
+                    # Generate absolute heatmap
+                    abs_heatmap_buffer = await generate_co_occurrence_heatmap(guild, guild_co_occurrence, relative=False)
+                    
+                    # Generate relative heatmap
+                    rel_heatmap_buffer = await generate_co_occurrence_heatmap(guild, guild_co_occurrence, relative=True)
 
-                    if heatmap_buffer:
-                        report_title = f"{guild.name} 每日成员共同在线时长热力图 (小时)"
-                        embed = discord.Embed(title=report_title, color=discord.Color.red())
-                        embed.set_image(url="attachment://daily_co_occurrence_abs.png")
-                        embed.timestamp = datetime.now()
-                        embed.set_footer(text="此报告每日自动生成")
+                    # Send both heatmaps if available
+                    if abs_heatmap_buffer:
+                        abs_report_title = f"{guild.name} 每日成员共同在线时长热力图 (小时)"
+                        abs_embed = discord.Embed(title=abs_report_title, color=discord.Color.red())
+                        abs_embed.description = "热力图显示每位成员与其他成员共同在线的绝对时长（小时）。"
+                        abs_embed.set_image(url="attachment://daily_co_occurrence_abs.png")
+                        abs_embed.timestamp = datetime.now()
+                        abs_embed.set_footer(text="此报告每日自动生成")
 
-                        file = discord.File(heatmap_buffer, filename="daily_co_occurrence_abs.png")
-                        await send_to_command_channel(self.bot, guild_id, embed=embed, file=file)
-                        logging.info(f"Sent daily heatmap report for guild {guild_id}")
-                    else:
-                        logging.error(f"Failed to generate daily heatmap for guild {guild_id}")
+                        abs_file = discord.File(abs_heatmap_buffer, filename="daily_co_occurrence_abs.png")
+                        await send_to_command_channel(self.bot, guild_id, embed=abs_embed, file=abs_file)
+                        logging.info(f"Sent daily absolute heatmap report for guild {guild_id}")
+                    
+                    # Send relative heatmap
+                    if rel_heatmap_buffer:
+                        # Allow some time between messages to avoid rate limiting
+                        await asyncio.sleep(1)
+                        
+                        rel_report_title = f"{guild.name} 每日成员共同在线时间比例热力图 (%)"
+                        rel_embed = discord.Embed(title=rel_report_title, color=discord.Color.blue())
+                        rel_embed.description = "热力图显示每位成员与其他成员共同在线的时间占该成员总在线时间的百分比。"
+                        rel_embed.set_image(url="attachment://daily_co_occurrence_rel.png")
+                        rel_embed.timestamp = datetime.now()
+                        rel_embed.set_footer(text="此报告每日自动生成")
+
+                        rel_file = discord.File(rel_heatmap_buffer, filename="daily_co_occurrence_rel.png")
+                        await send_to_command_channel(self.bot, guild_id, embed=rel_embed, file=rel_file)
+                        logging.info(f"Sent daily relative heatmap report for guild {guild_id}")
+                    
+                    # If both failed, send error message
+                    if not abs_heatmap_buffer and not rel_heatmap_buffer:
+                        logging.error(f"Failed to generate both daily heatmaps for guild {guild_id}")
                         await send_to_command_channel(
                             self.bot, guild_id,
                             content="生成每日关系热力图时出错。"
@@ -584,7 +608,14 @@ class StatsCog(commands.Cog):
     @commands.command(name='heatmap', aliases=['heat', 'matrix'])
     @check_channel()
     async def show_heatmap(self, ctx: commands.Context, mode: str = 'absolute'):
-        """显示成员共同在线时长热力图。模式: absolute (默认, 显示小时数) 或 relative (显示相对百分比)。"""
+        """显示成员共同在线时长热力图。
+        
+        参数:
+            mode: 热力图模式 
+                'absolute'/'abs' (默认): 显示绝对共同在线时长（小时）
+                'relative'/'rel': 显示相对共同在线时间百分比
+                'both': 同时显示绝对和相对两种热力图
+        """
         guild = ctx.guild
         if not guild:
             await ctx.send("此命令只能在服务器内使用。")
@@ -608,34 +639,72 @@ class StatsCog(commands.Cog):
         
         logging.debug(f"[Heatmap Cmd] Co-occurrence data fetched. Count: {len(guild_co_occurrence)} pairs. Preparing to generate...")
 
-        relative = mode.lower() == 'relative' or mode.lower() == 'rel'
+        # Process mode parameter
+        mode = mode.lower()
+        show_absolute = mode in ['absolute', 'abs', 'both']
+        show_relative = mode in ['relative', 'rel', 'both']
+        
+        # If invalid mode, default to absolute
+        if not show_absolute and not show_relative:
+            show_absolute = True
+            await ctx.send("未知的模式选项。使用默认的绝对时间模式。\n有效选项: `absolute`/`abs`, `relative`/`rel`, `both`", delete_after=10)
+
         try:
-            logging.info(f"[Heatmap Cmd] Calling generate_co_occurrence_heatmap (relative={relative})...")
-            heatmap_buffer = await generate_co_occurrence_heatmap(guild, guild_co_occurrence, relative=relative)
-            logging.info("[Heatmap Cmd] generate_co_occurrence_heatmap call finished.")
+            # Generate requested heatmaps
+            abs_heatmap_buffer = None
+            rel_heatmap_buffer = None
             
-            if heatmap_buffer:
-                logging.debug("[Heatmap Cmd] Heatmap buffer generated successfully.")
-                if relative:
-                    title = f"{guild.name} 成员共同在线时间比例热力图"
-                    description = "热力图显示每位成员与其他成员共同在线的时间占该成员总在线时间的百分比。"
-                    filename = "co_occurrence_rel.png"
-                else:
-                    title = f"{guild.name} 成员共同在线时长热力图"
-                    description = "热力图显示每位成员与其他成员共同在线的绝对时长（小时）。"
-                    filename = "co_occurrence_abs.png"
+            if show_absolute:
+                logging.info("[Heatmap Cmd] Generating absolute heatmap...")
+                abs_heatmap_buffer = await generate_co_occurrence_heatmap(guild, guild_co_occurrence, relative=False)
+                logging.info("[Heatmap Cmd] Absolute heatmap generation finished.")
                 
-                embed = discord.Embed(title=title, color=discord.Color.orange())
-                embed.description = description
-                embed.set_image(url=f"attachment://{filename}")
-                embed.timestamp = datetime.now()
-                file = discord.File(heatmap_buffer, filename=filename)
-                logging.info(f"[Heatmap Cmd] Sending heatmap image for guild {guild.id}...")
-                await ctx.send(embed=embed, file=file)
-                logging.info(f"[Heatmap Cmd] Heatmap sent successfully for guild {guild.id}.")
-            else:
-                logging.warning("[Heatmap Cmd] Heatmap buffer was None. No data or error during generation.")
+            if show_relative: 
+                logging.info("[Heatmap Cmd] Generating relative heatmap...")
+                rel_heatmap_buffer = await generate_co_occurrence_heatmap(guild, guild_co_occurrence, relative=True)
+                logging.info("[Heatmap Cmd] Relative heatmap generation finished.")
+            
+            # Send absolute heatmap if requested and available
+            if show_absolute and abs_heatmap_buffer:
+                logging.debug("[Heatmap Cmd] Sending absolute heatmap...")
+                abs_title = f"{guild.name} 成员共同在线时长热力图"
+                abs_description = "热力图显示每位成员与其他成员共同在线的绝对时长（小时）。"
+                abs_filename = "co_occurrence_abs.png"
+                
+                abs_embed = discord.Embed(title=abs_title, color=discord.Color.orange())
+                abs_embed.description = abs_description
+                abs_embed.set_image(url=f"attachment://{abs_filename}")
+                abs_embed.timestamp = datetime.now()
+                abs_file = discord.File(abs_heatmap_buffer, filename=abs_filename)
+                
+                await ctx.send(embed=abs_embed, file=abs_file)
+                logging.info(f"[Heatmap Cmd] Absolute heatmap sent for guild {guild.id}.")
+            
+            # Send relative heatmap if requested and available
+            if show_relative and rel_heatmap_buffer:
+                # Add a slight delay between messages to avoid rate limiting
+                if show_absolute and abs_heatmap_buffer:
+                    await asyncio.sleep(1)
+                
+                logging.debug("[Heatmap Cmd] Sending relative heatmap...")
+                rel_title = f"{guild.name} 成员共同在线时间比例热力图"
+                rel_description = "热力图显示每位成员与其他成员共同在线的时间占该成员总在线时间的百分比。"
+                rel_filename = "co_occurrence_rel.png"
+                
+                rel_embed = discord.Embed(title=rel_title, color=discord.Color.blue())
+                rel_embed.description = rel_description
+                rel_embed.set_image(url=f"attachment://{rel_filename}")
+                rel_embed.timestamp = datetime.now()
+                rel_file = discord.File(rel_heatmap_buffer, filename=rel_filename)
+                
+                await ctx.send(embed=rel_embed, file=rel_file)
+                logging.info(f"[Heatmap Cmd] Relative heatmap sent for guild {guild.id}.")
+            
+            # If all requested heatmaps failed
+            if (show_absolute and not abs_heatmap_buffer) and (show_relative and not rel_heatmap_buffer):
+                logging.warning("[Heatmap Cmd] All requested heatmaps failed to generate.")
                 await ctx.send("生成热力图时出错或没有足够的数据。热力图需要至少两位成员有共同在线记录。")
+                
         except Exception as e:
             logging.error(f"[Heatmap Cmd] Unexpected error during heatmap command execution: {e}", exc_info=True)
             await ctx.send(f"生成热力图时发生严重错误: {str(e)[:100]}...")
