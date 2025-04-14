@@ -11,6 +11,7 @@ import networkx as nx
 import matplotlib.cm as cm # Import colormap
 import matplotlib.colors as mcolors # For distinct colors
 from collections import Counter, defaultdict
+import warnings
 
 from utils.config import FONT_PATH
 from utils.helpers import get_preferred_name
@@ -44,7 +45,6 @@ if not font_loaded:
     sns.set_theme(style="whitegrid")
     
 # Configure matplotlib to not raise warnings for missing glyphs
-import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
 
 def create_heatmap(data: pd.DataFrame, title: str, color_map="viridis", annot=True, fmt=".1f") -> io.BytesIO:
@@ -67,17 +67,44 @@ def create_heatmap(data: pd.DataFrame, title: str, color_map="viridis", annot=Tr
     # Adjust figure size dynamically
     figsize_x = max(10, len(data.columns) * 0.8)
     figsize_y = max(8, len(data.index) * 0.6)
-    plt.figure(figsize=(figsize_x, figsize_y))
     
     try:
-        sns.heatmap(data, annot=annot, fmt=fmt, cmap=color_map, linewidths=.5, square=False)
+        # Use plt.figure within the try block
+        plt.figure(figsize=(figsize_x, figsize_y))
+        
+        # Suppress warnings specifically during seaborn plotting
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            sns.heatmap(data, annot=annot, fmt=fmt, cmap=color_map, linewidths=.5, square=False)
+            
         plt.title(title)
         plt.xticks(rotation=45, ha='right') # Improve label readability
         plt.yticks(rotation=0)
-        plt.tight_layout(pad=2.0) # Add padding
+        
+        # Safely apply tight_layout with fallback
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                plt.tight_layout(pad=2.0)  # Add padding
+        except Exception as layout_error:
+            logging.warning(f"Error during tight_layout for heatmap '{title}': {layout_error}")
+            plt.subplots_adjust(left=0.1, right=0.9, top=0.9, bottom=0.1)
 
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        except Exception as save_error:
+            logging.warning(f"Error saving heatmap '{title}' with bbox_inches='tight', trying without: {save_error}")
+            try:
+                 with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    plt.savefig(buf, format='png', dpi=150)
+            except Exception as e:
+                logging.error(f"All attempts to save heatmap '{title}' failed: {e}")
+                return None
+            
         buf.seek(0)
         return buf
     except Exception as e:
@@ -97,26 +124,51 @@ async def generate_co_occurrence_heatmap(guild: discord.Guild, co_occurrence_dat
     Returns:
         io.BytesIO | None: A BytesIO object containing the PNG image data, or None if error/no data.
     """
-    if not co_occurrence_data:
-        logging.info(f"No co-occurrence data for guild {guild.id} to generate heatmap.")
+    if not co_occurrence_data or not isinstance(co_occurrence_data, dict):
+        logging.warning(f"Invalid or empty co_occurrence_data provided for guild {guild.id}. Type: {type(co_occurrence_data)}")
         return None
+
+    # --- Defensive Data Extraction --- 
+    processed_pairs = []
+    member_ids_with_data = set()
+    total_times = defaultdict(float) # For relative calculation
+
+    for key, duration in co_occurrence_data.items():
+        if not isinstance(key, tuple) or len(key) != 2:
+            logging.warning(f"Skipping invalid key in co_occurrence_data for guild {guild.id}: {key} (type: {type(key)}) ")
+            continue
+        try:
+            m1_id, m2_id = int(key[0]), int(key[1])
+            duration_float = float(duration)
+            if duration_float <= 0:
+                continue # Skip zero or negative durations
+                
+            processed_pairs.append(((m1_id, m2_id), duration_float))
+            member_ids_with_data.add(m1_id)
+            member_ids_with_data.add(m2_id)
+            # Accumulate total time for relative calculation
+            total_times[m1_id] += duration_float
+            total_times[m2_id] += duration_float
+            
+        except (ValueError, TypeError) as e:
+            logging.warning(f"Skipping invalid data entry in co_occurrence_data for guild {guild.id}: Key={key}, Duration={duration}. Error: {e}")
+            continue
+            
+    if not processed_pairs:
+        logging.info(f"No valid co-occurrence pairs found after processing for guild {guild.id}.")
+        return None
+    # --- End Defensive Data Extraction ---
 
     # Fetch members efficiently once
     try:
-        await guild.chunk() # Ensure member cache is populated if needed and intents allow
+        await guild.chunk()
         members_map = {m.id: m for m in guild.members}
     except Exception as e:
-        logging.warning(f"Error while chunking guild {guild.id}: {e}")
-        # Fallback: Use cached members, might miss some users
+        logging.warning(f"Error while chunking guild {guild.id} for heatmap: {e}")
         members_map = {m.id: m for m in guild.members}
         if not members_map:
              logging.error(f"No members found in cache for guild {guild.id}. Cannot generate heatmap.")
              return None
-
-    member_ids_with_data = set()
-    for m1, m2 in co_occurrence_data.keys():
-        member_ids_with_data.add(m1)
-        member_ids_with_data.add(m2)
 
     active_member_ids = sorted([mid for mid in member_ids_with_data if mid in members_map])
     member_names = {mid: get_preferred_name(members_map[mid]) for mid in active_member_ids}
@@ -127,31 +179,32 @@ async def generate_co_occurrence_heatmap(guild: discord.Guild, co_occurrence_dat
         return None
 
     matrix = np.zeros((matrix_size, matrix_size))
-    total_times = defaultdict(float) # Needed for relative calculation
 
-    # Populate matrix and total times
+    # Create a lookup for the processed pairs
+    processed_pairs_dict = {tuple(sorted(pair)): dur for pair, dur in processed_pairs}
+
+    # Populate matrix using active_member_ids index
     for i, m1_id in enumerate(active_member_ids):
         for j, m2_id in enumerate(active_member_ids):
             if i == j:
-                continue # Skip self-co-occurrence
-            pair = tuple(sorted((m1_id, m2_id)))
-            duration_seconds = co_occurrence_data.get(pair, 0.0)
+                continue 
+            pair_key = tuple(sorted((m1_id, m2_id)))
+            duration_seconds = processed_pairs_dict.get(pair_key, 0.0)
             matrix[i, j] = duration_seconds / 3600.0 # Convert to hours
-            # Accumulate total time for relative calculation (only need to do once per pair)
-            if i < j and duration_seconds > 0:
-                total_times[m1_id] += duration_seconds
-                total_times[m2_id] += duration_seconds
 
     if relative:
         relative_matrix = np.zeros((matrix_size, matrix_size))
         for i, m1_id in enumerate(active_member_ids):
-            m1_total = total_times.get(m1_id, 0.0)
+            # Use total_times calculated during initial processing
+            m1_total = total_times.get(m1_id, 0.0) 
             for j, m2_id in enumerate(active_member_ids):
                 if i == j or m1_total == 0:
-                    continue # Avoid division by zero
-                pair = tuple(sorted((m1_id, m2_id)))
-                duration_seconds = co_occurrence_data.get(pair, 0.0)
-                relative_matrix[i, j] = (duration_seconds / m1_total) * 100
+                    continue
+                pair_key = tuple(sorted((m1_id, m2_id)))
+                duration_seconds = processed_pairs_dict.get(pair_key, 0.0)
+                # Calculate relative percentage against the specific member's total co-occurrence time
+                relative_matrix[i, j] = (duration_seconds / m1_total) * 100 if m1_total > 0 else 0
+                
         matrix = relative_matrix
         title = f'{guild.name} 成员共同在线时间比例 (%)'
         fmt = ".1f"
@@ -164,7 +217,7 @@ async def generate_co_occurrence_heatmap(guild: discord.Guild, co_occurrence_dat
     active_member_names_list = [member_names[mid] for mid in active_member_ids]
     df = pd.DataFrame(matrix, index=active_member_names_list, columns=active_member_names_list)
 
-    # Heatmap function now handles empty check, no need to filter here
+    # Heatmap function now handles empty check
     return create_heatmap(df, title, color_map=color_map, fmt=fmt, annot=True if len(df) <= 20 else False)
 
 async def generate_periodic_chart(guild: discord.Guild, voice_stats_data: dict, period: str) -> io.BytesIO | None:
@@ -191,17 +244,17 @@ async def generate_periodic_chart(guild: discord.Guild, voice_stats_data: dict, 
     data = []
     # Fetch members efficiently
     try:
-        await guild.chunk() # Ensure member cache is populated if needed
+        await guild.chunk()
         members_map = {m.id: m for m in guild.members}
-    except discord.errors.ClientException:
-        logging.warning(f"Could not chunk guild {guild.id}, member names might be incomplete for chart.")
+    except Exception as e:
+        logging.warning(f"Error while chunking guild {guild.id} for {period} chart: {e}")
         members_map = {m.id: m for m in guild.members}
 
     for member_id, stats in voice_stats_data.items():
         member = members_map.get(member_id)
         name = get_preferred_name(member) if member else f"Left User ({member_id})"
         duration_seconds = stats.get(period, 0)
-        if duration_seconds > 1: # Only include members with >1s activity in the period
+        if duration_seconds > 1:
             data.append({'Member': name, 'DurationHours': duration_seconds / 3600.0})
 
     if not data:
@@ -209,24 +262,47 @@ async def generate_periodic_chart(guild: discord.Guild, voice_stats_data: dict, 
         return None
 
     df = pd.DataFrame(data)
-    df = df.sort_values(by='DurationHours', ascending=False).head(30) # Limit to top 30
+    df = df.sort_values(by='DurationHours', ascending=False).head(30)
 
-    plt.figure(figsize=(12, max(6, len(df) * 0.4)))
     try:
-        # Assign `y` to `hue` and disable legend to fix FutureWarning
-        barplot = sns.barplot(x='DurationHours', y='Member', hue='Member', data=df, palette="viridis", orient='h', legend=False)
-
-        # Add labels to bars
-        for container in barplot.containers:
-            barplot.bar_label(container, fmt='%.1f h', padding=3, fontsize=10)
+        plt.figure(figsize=(12, max(6, len(df) * 0.4)))
+        
+        # Suppress warnings specifically during seaborn plotting and labeling
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            barplot = sns.barplot(x='DurationHours', y='Member', hue='Member', data=df, palette="viridis", orient='h', legend=False)
+            # Add labels to bars
+            for container in barplot.containers:
+                barplot.bar_label(container, fmt='%.1f h', padding=3, fontsize=10)
 
         plt.title(f'{guild.name} {title_period}语音在线时长 (Top {len(df)})')
         plt.xlabel('时长 (小时)')
         plt.ylabel('成员')
-        plt.tight_layout(pad=1.5)
+        
+        # Safely apply tight_layout with fallback
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                plt.tight_layout(pad=1.5)
+        except Exception as layout_error:
+            logging.warning(f"Error during tight_layout for {period} chart: {layout_error}")
+            plt.subplots_adjust(left=0.2, right=0.9, top=0.9, bottom=0.1)
 
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        except Exception as save_error:
+            logging.warning(f"Error saving {period} chart with bbox_inches='tight', trying without: {save_error}")
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    plt.savefig(buf, format='png', dpi=150)
+            except Exception as e:
+                logging.error(f"All attempts to save {period} chart failed: {e}")
+                return None
+            
         buf.seek(0)
         return buf
     except Exception as e:
@@ -286,8 +362,8 @@ async def generate_relationship_network_graph(guild: discord.Guild, co_occurrenc
     try:
         await guild.chunk()
         members_map = {m.id: m for m in guild.members}
-    except discord.errors.ClientException:
-        logging.warning(f"Could not chunk guild {guild.id}, member names incomplete.")
+    except Exception as e:
+        logging.warning(f"Error while chunking guild {guild.id}: {e}")
         members_map = {m.id: m for m in guild.members}
 
     G = nx.Graph()
@@ -326,54 +402,90 @@ async def generate_relationship_network_graph(guild: discord.Guild, co_occurrenc
          return None
 
     # --- Graph Drawing --- 
-    plt.figure(figsize=(20, 20))
+    node_count = G.number_of_nodes()
+    fig_size = min(30, max(20, node_count * 1.5))  # Dynamic figure size
+    
     try:
-        # Layout algorithm - spring layout with stronger separation
-        node_count = G.number_of_nodes()
-        # Increase k significantly more
-        k_value = 6.0 / np.sqrt(node_count) if node_count > 0 else 1.0 
-        pos = nx.spring_layout(G, k=k_value, iterations=250, seed=42) # Increased iterations
+        plt.figure(figsize=(fig_size, fig_size))
+
+        # Layout calculation (remains the same)
+        initial_pos = nx.circular_layout(G, scale=2.0)
+        k_value = 15.0 / np.sqrt(node_count) if node_count > 0 else 2.0
+        pos = nx.spring_layout(G, k=k_value, iterations=800, seed=42, pos=initial_pos, weight=None)
+        scaling_factor = 1.3
+        for node in pos:
+            pos[node] = tuple(coord * scaling_factor for coord in pos[node])
         
-        # Assign unique colors to nodes (remains same)
+        # Colors and node attributes (remains the same)
         colors = plt.get_cmap('tab20').colors 
         node_color_map = {node: colors[i % len(colors)] for i, node in enumerate(G.nodes())}
         node_colors = [node_color_map[node] for node in G.nodes()]
-
-        # Node shape and fixed size (reduced slightly)
-        node_shape = 's' # Square marker
-        fixed_node_size = 1000 # Reduced size
-
-        # Edge width/alpha scaling (make weakest edges fainter)
-        if max_duration <= min_duration: 
+        node_shape = 'o'
+        fixed_node_size = max(500, 1000 - (node_count * 25))
+        
+        # Edge attributes (remains the same)
+        if max_duration <= min_duration:
              norm_weights = [0.5] * G.number_of_edges()
         else:
              power = 1.5 
              norm_weights = [((d['weight'] - min_duration) / (max_duration - min_duration)) ** power 
                            for u, v, d in G.edges(data=True)]
-        edge_widths = [0.5 + w * 5.0 for w in norm_weights] 
-        edge_alphas = [0.05 + w * 0.65 for w in norm_weights] # Make base fainter, scale less aggressively
+        edge_widths = [0.5 + w * 4.0 for w in norm_weights] 
+        edge_alphas = [0.05 + w * 0.5 for w in norm_weights]
 
-        # Draw nodes with square shape and fixed size
-        nx.draw_networkx_nodes(G, pos, 
-                               node_size=fixed_node_size, 
-                               node_color=node_colors, 
-                               node_shape=node_shape, 
-                               alpha=0.9)
+        # Suppress warnings during drawing operations
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            
+            # Draw nodes
+            nx.draw_networkx_nodes(G, pos, 
+                                   node_size=fixed_node_size, 
+                                   node_color=node_colors, 
+                                   node_shape=node_shape, 
+                                   alpha=0.9)
 
-        # Draw edges (remains same)
-        nx.draw_networkx_edges(G, pos, width=edge_widths, alpha=edge_alphas, edge_color='darkgrey')
+            # Draw edges
+            nx.draw_networkx_edges(G, pos, width=edge_widths, alpha=edge_alphas, edge_color='darkgrey')
 
-        # Draw labels (remains same, with bbox)
-        labels = nx.get_node_attributes(G, 'label')
-        nx.draw_networkx_labels(G, pos, labels=labels, font_size=9, 
-                               font_family=font_prop.get_name() if font_prop else 'sans-serif',
-                               bbox=dict(facecolor='white', alpha=0.6, edgecolor='none', boxstyle='round,pad=0.2'))
+            # Draw labels with improved spacing and font size
+            labels = nx.get_node_attributes(G, 'label')
+            label_pos = {node: (coords[0], coords[1] + 0.07) for node, coords in pos.items()}
+            font_size = max(7, 11 - (node_count * 0.2))
+            
+            # Safely add labels with fallback for problematic characters
+            try:
+                nx.draw_networkx_labels(G, label_pos, labels=labels, font_size=font_size, 
+                                       font_family=font_prop.get_name() if font_prop else 'sans-serif',
+                                       bbox=dict(facecolor='white', alpha=0.9, edgecolor='lightgrey', 
+                                                boxstyle='round,pad=0.4'),
+                                       verticalalignment='bottom')
+            except Exception as label_error:
+                logging.warning(f"Error drawing network labels with formatting: {label_error}")
+                try:
+                    nx.draw_networkx_labels(G, label_pos, labels=labels, font_size=font_size)
+                except Exception as e:
+                    logging.error(f"Even simplified label drawing failed: {e}")
 
         plt.title(f'{guild.name} - 成员关系网络图 (Top 10 Co + Top 10 Wkly)', fontsize=16, fontproperties=font_prop if font_prop else None)
         plt.axis('off')
+        plt.xlim(-1.5, 1.5)
+        plt.ylim(-1.5, 1.5)
 
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=180, bbox_inches='tight') 
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                plt.savefig(buf, format='png', dpi=180, bbox_inches='tight')
+        except Exception as save_error:
+            logging.warning(f"Error saving relationship graph with bbox_inches='tight', trying without: {save_error}")
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    plt.savefig(buf, format='png', dpi=180)
+            except Exception as e:
+                logging.error(f"All attempts to save relationship graph failed: {e}")
+                return None
+                
         buf.seek(0)
         return buf
 

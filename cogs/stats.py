@@ -581,6 +581,56 @@ class StatsCog(commands.Cog):
         except discord.HTTPException:
             pass
 
+    @commands.command(name='heatmap', aliases=['heat', 'matrix'])
+    @check_channel()
+    async def show_heatmap(self, ctx: commands.Context, mode: str = 'absolute'):
+        """显示成员共同在线时长热力图。模式: absolute (默认, 显示小时数) 或 relative (显示相对百分比)。"""
+        guild = ctx.guild
+        if not guild:
+            await ctx.send("此命令只能在服务器内使用。")
+            return
+
+        await ctx.message.add_reaction('⏳')
+
+        guild_co_occurrence = self.co_occurrence_stats.get(guild.id)
+
+        if not guild_co_occurrence:
+            await ctx.send("尚未记录此服务器的共同在线数据。")
+            await ctx.message.remove_reaction('⏳', self.bot.user)
+            return
+
+        relative = mode.lower() == 'relative' or mode.lower() == 'rel'
+        try:
+            heatmap_buffer = await generate_co_occurrence_heatmap(guild, guild_co_occurrence, relative=relative)
+            
+            if heatmap_buffer:
+                if relative:
+                    title = f"{guild.name} 成员共同在线时间比例热力图"
+                    description = "热力图显示每位成员与其他成员共同在线的时间占该成员总在线时间的百分比。"
+                    filename = "co_occurrence_rel.png"
+                else:
+                    title = f"{guild.name} 成员共同在线时长热力图"
+                    description = "热力图显示每位成员与其他成员共同在线的绝对时长（小时）。"
+                    filename = "co_occurrence_abs.png"
+                
+                embed = discord.Embed(title=title, color=discord.Color.orange())
+                embed.description = description
+                embed.set_image(url=f"attachment://{filename}")
+                embed.timestamp = datetime.now()
+                file = discord.File(heatmap_buffer, filename=filename)
+                await ctx.send(embed=embed, file=file)
+            else:
+                await ctx.send("生成热力图时出错或没有足够的数据。热力图需要至少两位成员有共同在线记录。")
+        except Exception as e:
+            logging.error(f"Error generating heatmap for guild {guild.id}: {e}", exc_info=True)
+            await ctx.send(f"生成热力图时出错: {str(e)[:100]}...")
+        finally:
+            try:
+                await ctx.message.remove_reaction('⏳', self.bot.user)
+                await ctx.message.add_reaction('✅')
+            except discord.HTTPException:
+                pass
+
 async def setup(bot: commands.Bot):
     db_manager = DatabaseManager() # Create instance here
     await bot.add_cog(StatsCog(bot, db_manager)) 
