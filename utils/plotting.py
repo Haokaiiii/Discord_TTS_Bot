@@ -15,25 +15,37 @@ from collections import Counter, defaultdict
 from utils.config import FONT_PATH
 from utils.helpers import get_preferred_name
 
-# Configure Matplotlib font
-if os.path.exists(FONT_PATH):
-    font_prop = fm.FontProperties(fname=FONT_PATH)
-    plt.rcParams['font.sans-serif'] = [font_prop.get_name()]
-    plt.rcParams['font.family'] = 'sans-serif'
-    plt.rcParams['axes.unicode_minus'] = False
-    # Apply font prop directly to sns.set_theme if using newer Seaborn versions
-    try:
-        sns.set_theme(style="whitegrid", font=font_prop.get_name())
-    except TypeError:
-        # Fallback for older versions or if direct font name setting fails
-        sns.set_theme(style="whitegrid")
-        plt.rcParams['font.sans-serif'] = [font_prop.get_name()]
-        logging.warning("Could not set font directly in sns.set_theme, using plt.rcParams fallback.")
+# Configure Matplotlib font with better error handling
+plt.rcParams['font.sans-serif'] = ['WenQuanYi Zen Hei', 'DejaVu Sans', 'Arial Unicode MS', 'sans-serif']
+plt.rcParams['axes.unicode_minus'] = False
 
-    logging.info(f"Using font: {font_prop.get_name()} from {FONT_PATH}")
-else:
-    logging.warning(f"Font file {FONT_PATH} not found. Using default font.")
+# Try to load Chinese font if available, but provide fallback
+font_loaded = False
+if os.path.exists(FONT_PATH):
+    try:
+        font_prop = fm.FontProperties(fname=FONT_PATH)
+        plt.rcParams['font.sans-serif'] = [font_prop.get_name()] + plt.rcParams['font.sans-serif']
+        # Apply font prop directly to sns.set_theme if using newer Seaborn versions
+        try:
+            sns.set_theme(style="whitegrid", font=font_prop.get_name())
+        except TypeError:
+            # Fallback for older versions or if direct font name setting fails
+            sns.set_theme(style="whitegrid")
+            plt.rcParams['font.sans-serif'] = [font_prop.get_name()] + plt.rcParams['font.sans-serif']
+            logging.warning("Could not set font directly in sns.set_theme, using plt.rcParams fallback.")
+
+        logging.info(f"Using font: {font_prop.get_name()} from {FONT_PATH}")
+        font_loaded = True
+    except Exception as e:
+        logging.warning(f"Error loading font from {FONT_PATH}: {e}")
+        
+if not font_loaded:
+    logging.warning(f"Font file {FONT_PATH} not found or couldn't be loaded. Using default fonts.")
     sns.set_theme(style="whitegrid")
+    
+# Configure matplotlib to not raise warnings for missing glyphs
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
 
 def create_heatmap(data: pd.DataFrame, title: str, color_map="viridis", annot=True, fmt=".1f") -> io.BytesIO:
     """Generates a heatmap from a Pandas DataFrame and returns it as BytesIO.
@@ -93,8 +105,8 @@ async def generate_co_occurrence_heatmap(guild: discord.Guild, co_occurrence_dat
     try:
         await guild.chunk() # Ensure member cache is populated if needed and intents allow
         members_map = {m.id: m for m in guild.members}
-    except discord.errors.ClientException:
-        logging.warning(f"Could not chunk guild {guild.id}, member names might be incomplete.")
+    except Exception as e:
+        logging.warning(f"Error while chunking guild {guild.id}: {e}")
         # Fallback: Use cached members, might miss some users
         members_map = {m.id: m for m in guild.members}
         if not members_map:
@@ -153,11 +165,6 @@ async def generate_co_occurrence_heatmap(guild: discord.Guild, co_occurrence_dat
     df = pd.DataFrame(matrix, index=active_member_names_list, columns=active_member_names_list)
 
     # Heatmap function now handles empty check, no need to filter here
-    # df = df.loc[df.sum(axis=1) > 0, df.sum(axis=0) > 0]
-    # if df.empty:
-    #     logging.info(f"Filtered co-occurrence data is empty for guild {guild.id}. No heatmap generated.")
-    #     return None
-
     return create_heatmap(df, title, color_map=color_map, fmt=fmt, annot=True if len(df) <= 20 else False)
 
 async def generate_periodic_chart(guild: discord.Guild, voice_stats_data: dict, period: str) -> io.BytesIO | None:

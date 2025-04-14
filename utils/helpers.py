@@ -34,37 +34,41 @@ async def send_to_command_channel(bot: commands.Bot, guild_id: int, content: str
     """Sends a message, file, or embed to the designated command channel for a guild."""
     from utils.config import ALLOWED_COMMAND_CHANNEL_ID
 
-    if ALLOWED_COMMAND_CHANNEL_ID == 0:
-        logging.warning(f"Command channel not configured for guild {guild_id}. Cannot send message.")
-        return
-
     guild = bot.get_guild(guild_id)
     if not guild:
         logging.warning(f"Could not find guild {guild_id}. Cannot send message.")
         return
 
-    channel = guild.get_channel(ALLOWED_COMMAND_CHANNEL_ID)
+    channel = None
+    if ALLOWED_COMMAND_CHANNEL_ID != 0:
+        channel = guild.get_channel(ALLOWED_COMMAND_CHANNEL_ID)
+        
     if not channel or not isinstance(channel, discord.TextChannel):
-        # Fallback: Try to find the first available text channel the bot can write to
+        if ALLOWED_COMMAND_CHANNEL_ID != 0:
+            logging.warning(f"Designated command channel {ALLOWED_COMMAND_CHANNEL_ID} not found or invalid in guild {guild_id}. Looking for fallback channel.")
+        else:
+            logging.info(f"No command channel configured for guild {guild_id}. Looking for fallback channel.")
+            
+        # Try to find the first available text channel the bot can write to
         fallback_channel = None
         for ch in guild.text_channels:
             if ch.permissions_for(guild.me).send_messages:
                 fallback_channel = ch
                 break
         if fallback_channel:
-             logging.warning(f"Designated command channel {ALLOWED_COMMAND_CHANNEL_ID} not found or invalid in guild {guild_id}. Sending to fallback {fallback_channel.name} ({fallback_channel.id}).")
+             logging.info(f"Using fallback channel {fallback_channel.name} ({fallback_channel.id}) in guild {guild_id}.")
              channel = fallback_channel
         else:
-             logging.error(f"Designated command channel {ALLOWED_COMMAND_CHANNEL_ID} not found or invalid, and no fallback channel found in guild {guild_id}. Cannot send message.")
+             logging.error(f"No suitable fallback channel found in guild {guild_id}. Cannot send message.")
              return
 
     try:
         await channel.send(content=content, file=file, embed=embed)
-        logging.info(f"Sent message to command channel {channel.name} ({channel.id}) in guild {guild_id}")
+        logging.info(f"Sent message to channel {channel.name} ({channel.id}) in guild {guild_id}")
     except discord.Forbidden:
         logging.error(f"Missing permissions to send messages in channel {channel.name} ({channel.id}) in guild {guild_id}.")
     except discord.HTTPException as e:
-        logging.error(f"Failed to send message to command channel {channel.name} ({channel.id}) in guild {guild_id}: {e}")
+        logging.error(f"Failed to send message to channel {channel.name} ({channel.id}) in guild {guild_id}: {e}")
 
 class BotException(Exception):
     """Custom exception class for bot-specific errors."""

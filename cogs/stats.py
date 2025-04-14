@@ -372,49 +372,62 @@ class StatsCog(commands.Cog):
         # Let's use the current in-memory stats for simplicity, assuming reset/report timings are sane.
         # voice_stats_for_report = self.db_manager.load_voice_stats()
 
-        for guild in self.bot.guilds:
-            guild_id = guild.id
-            logging.info(f"Generating {period} report for guild {guild.name} ({guild_id})")
+        try:
+            for guild in self.bot.guilds:
+                guild_id = guild.id
+                logging.info(f"Generating {period} report for guild {guild.name} ({guild_id})")
 
-            guild_stats = self.voice_stats.get(guild_id)
-            if not guild_stats:
-                logging.warning(f"No voice stats found for guild {guild_id} when generating {period} report.")
-                continue
+                try:
+                    guild_stats = self.voice_stats.get(guild_id)
+                    if not guild_stats:
+                        logging.warning(f"No voice stats found for guild {guild_id} when generating {period} report.")
+                        continue
 
-            # Filter stats for the period, excluding those with 0 time
-            period_stats = {
-                mid: stats
-                for mid, stats in guild_stats.items()
-                if stats.get(period, 0) > 0
-            }
+                    # Filter stats for the period, excluding those with 0 time
+                    period_stats = {
+                        mid: stats
+                        for mid, stats in guild_stats.items()
+                        if stats.get(period, 0) > 0
+                    }
 
-            if not period_stats:
-                 logging.info(f"No activity found for period '{period}' in guild {guild_id}. Skipping report.")
-                 await send_to_command_channel(
-                     self.bot, guild_id,
-                     content=f"{period.capitalize()} 语音活动报告：本时段内无成员在线。"
-                 )
-                 continue
+                    if not period_stats:
+                         logging.info(f"No activity found for period '{period}' in guild {guild_id}. Skipping report.")
+                         await send_to_command_channel(
+                             self.bot, guild_id,
+                             content=f"{period.capitalize()} 语音活动报告：本时段内无成员在线。"
+                         )
+                         continue
 
-            chart_buffer = await generate_periodic_chart(guild, period_stats, period)
+                    chart_buffer = await generate_periodic_chart(guild, period_stats, period)
 
-            if chart_buffer:
-                period_map = {'daily': '每日', 'weekly': '每周', 'monthly': '每月', 'yearly': '年度'}
-                report_title = f"{guild.name} {period_map.get(period, period.capitalize())} 语音活动报告"
+                    if chart_buffer:
+                        period_map = {'daily': '每日', 'weekly': '每周', 'monthly': '每月', 'yearly': '年度'}
+                        report_title = f"{guild.name} {period_map.get(period, period.capitalize())} 语音活动报告"
 
-                embed = discord.Embed(title=report_title, color=discord.Color.blue())
-                embed.set_image(url=f"attachment://{period}_stats.png")
-                embed.timestamp = datetime.now()
+                        embed = discord.Embed(title=report_title, color=discord.Color.blue())
+                        embed.set_image(url=f"attachment://{period}_stats.png")
+                        embed.timestamp = datetime.now()
 
-                file = discord.File(chart_buffer, filename=f"{period}_stats.png")
-                await send_to_command_channel(self.bot, guild_id, embed=embed, file=file)
-                logging.info(f"Sent {period} report for guild {guild_id}")
-            else:
-                logging.error(f"Failed to generate {period} chart for guild {guild_id}")
-                await send_to_command_channel(
-                    self.bot, guild_id,
-                    content=f"生成 {period.capitalize()} 语音活动图表时出错。"
-                )
+                        file = discord.File(chart_buffer, filename=f"{period}_stats.png")
+                        await send_to_command_channel(self.bot, guild_id, embed=embed, file=file)
+                        logging.info(f"Sent {period} report for guild {guild_id}")
+                    else:
+                        logging.error(f"Failed to generate {period} chart for guild {guild_id}")
+                        await send_to_command_channel(
+                            self.bot, guild_id,
+                            content=f"生成 {period.capitalize()} 语音活动图表时出错。"
+                        )
+                except Exception as e:
+                    logging.error(f"Error processing {period} report for guild {guild_id}: {e}", exc_info=True)
+                    try:
+                        await send_to_command_channel(
+                            self.bot, guild_id,
+                            content=f"生成 {period.capitalize()} 语音活动报告时发生错误: {str(e)[:100]}..."
+                        )
+                    except:
+                        logging.error(f"Failed to send error message to guild {guild_id}")
+        except Exception as e:
+            logging.error(f"Critical error in {period} report task: {e}", exc_info=True)
 
     async def send_daily_heatmap_report(self):
         """Generates and sends the daily co-occurrence heatmap report to each guild."""
@@ -428,35 +441,48 @@ class StatsCog(commands.Cog):
         # Consider reloading co-occurrence stats from DB for consistency?
         # Using in-memory stats for now.
 
-        for guild in self.bot.guilds:
-            guild_id = guild.id
-            logging.info(f"Generating daily heatmap report for guild {guild.name} ({guild_id})")
+        try:
+            for guild in self.bot.guilds:
+                guild_id = guild.id
+                logging.info(f"Generating daily heatmap report for guild {guild.name} ({guild_id})")
 
-            guild_co_occurrence = self.co_occurrence_stats.get(guild_id)
-            if not guild_co_occurrence:
-                logging.info(f"No co-occurrence data for guild {guild_id}. Skipping daily heatmap report.")
-                # Optionally send a message? 
-                # await send_to_command_channel(self.bot, guild_id, content="每日关系热力图：无数据可生成。")
-                continue
+                try:
+                    guild_co_occurrence = self.co_occurrence_stats.get(guild_id)
+                    if not guild_co_occurrence:
+                        logging.info(f"No co-occurrence data for guild {guild_id}. Skipping daily heatmap report.")
+                        # Optionally send a message? 
+                        # await send_to_command_channel(self.bot, guild_id, content="每日关系热力图：无数据可生成。")
+                        continue
 
-            heatmap_buffer = await generate_co_occurrence_heatmap(guild, guild_co_occurrence, relative=False)
+                    heatmap_buffer = await generate_co_occurrence_heatmap(guild, guild_co_occurrence, relative=False)
 
-            if heatmap_buffer:
-                report_title = f"{guild.name} 每日成员共同在线时长热力图 (小时)"
-                embed = discord.Embed(title=report_title, color=discord.Color.red())
-                embed.set_image(url="attachment://daily_co_occurrence_abs.png")
-                embed.timestamp = datetime.now()
-                embed.set_footer(text="此报告每日自动生成")
+                    if heatmap_buffer:
+                        report_title = f"{guild.name} 每日成员共同在线时长热力图 (小时)"
+                        embed = discord.Embed(title=report_title, color=discord.Color.red())
+                        embed.set_image(url="attachment://daily_co_occurrence_abs.png")
+                        embed.timestamp = datetime.now()
+                        embed.set_footer(text="此报告每日自动生成")
 
-                file = discord.File(heatmap_buffer, filename="daily_co_occurrence_abs.png")
-                await send_to_command_channel(self.bot, guild_id, embed=embed, file=file)
-                logging.info(f"Sent daily heatmap report for guild {guild_id}")
-            else:
-                logging.error(f"Failed to generate daily heatmap for guild {guild_id}")
-                await send_to_command_channel(
-                    self.bot, guild_id,
-                    content="生成每日关系热力图时出错。"
-                )
+                        file = discord.File(heatmap_buffer, filename="daily_co_occurrence_abs.png")
+                        await send_to_command_channel(self.bot, guild_id, embed=embed, file=file)
+                        logging.info(f"Sent daily heatmap report for guild {guild_id}")
+                    else:
+                        logging.error(f"Failed to generate daily heatmap for guild {guild_id}")
+                        await send_to_command_channel(
+                            self.bot, guild_id,
+                            content="生成每日关系热力图时出错。"
+                        )
+                except Exception as e:
+                    logging.error(f"Error processing heatmap for guild {guild_id}: {e}", exc_info=True)
+                    try:
+                        await send_to_command_channel(
+                            self.bot, guild_id,
+                            content=f"生成每日关系热力图时发生错误: {str(e)[:100]}..."
+                        )
+                    except:
+                        logging.error(f"Failed to send error message to guild {guild_id}")
+        except Exception as e:
+            logging.error(f"Critical error in daily heatmap report task: {e}", exc_info=True)
 
     # --- Commands --- 
 
