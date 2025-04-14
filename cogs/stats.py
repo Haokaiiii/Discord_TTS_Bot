@@ -589,21 +589,33 @@ class StatsCog(commands.Cog):
         if not guild:
             await ctx.send("此命令只能在服务器内使用。")
             return
+        
+        logging.info(f"[Heatmap Cmd] Received heatmap command for guild {guild.id} (Mode: {mode})")
 
         await ctx.message.add_reaction('⏳')
 
+        logging.debug("[Heatmap Cmd] Fetching co-occurrence data...")
         guild_co_occurrence = self.co_occurrence_stats.get(guild.id)
 
         if not guild_co_occurrence:
+            logging.warning(f"[Heatmap Cmd] No co-occurrence data found for guild {guild.id}")
             await ctx.send("尚未记录此服务器的共同在线数据。")
-            await ctx.message.remove_reaction('⏳', self.bot.user)
+            try:
+                await ctx.message.remove_reaction('⏳', self.bot.user)
+            except discord.HTTPException:
+                pass
             return
+        
+        logging.debug(f"[Heatmap Cmd] Co-occurrence data fetched. Count: {len(guild_co_occurrence)} pairs. Preparing to generate...")
 
         relative = mode.lower() == 'relative' or mode.lower() == 'rel'
         try:
+            logging.info(f"[Heatmap Cmd] Calling generate_co_occurrence_heatmap (relative={relative})...")
             heatmap_buffer = await generate_co_occurrence_heatmap(guild, guild_co_occurrence, relative=relative)
+            logging.info("[Heatmap Cmd] generate_co_occurrence_heatmap call finished.")
             
             if heatmap_buffer:
+                logging.debug("[Heatmap Cmd] Heatmap buffer generated successfully.")
                 if relative:
                     title = f"{guild.name} 成员共同在线时间比例热力图"
                     description = "热力图显示每位成员与其他成员共同在线的时间占该成员总在线时间的百分比。"
@@ -618,17 +630,22 @@ class StatsCog(commands.Cog):
                 embed.set_image(url=f"attachment://{filename}")
                 embed.timestamp = datetime.now()
                 file = discord.File(heatmap_buffer, filename=filename)
+                logging.info(f"[Heatmap Cmd] Sending heatmap image for guild {guild.id}...")
                 await ctx.send(embed=embed, file=file)
+                logging.info(f"[Heatmap Cmd] Heatmap sent successfully for guild {guild.id}.")
             else:
+                logging.warning("[Heatmap Cmd] Heatmap buffer was None. No data or error during generation.")
                 await ctx.send("生成热力图时出错或没有足够的数据。热力图需要至少两位成员有共同在线记录。")
         except Exception as e:
-            logging.error(f"Error generating heatmap for guild {guild.id}: {e}", exc_info=True)
-            await ctx.send(f"生成热力图时出错: {str(e)[:100]}...")
+            logging.error(f"[Heatmap Cmd] Unexpected error during heatmap command execution: {e}", exc_info=True)
+            await ctx.send(f"生成热力图时发生严重错误: {str(e)[:100]}...")
         finally:
+            logging.debug("[Heatmap Cmd] Removing reaction...")
             try:
                 await ctx.message.remove_reaction('⏳', self.bot.user)
                 await ctx.message.add_reaction('✅')
             except discord.HTTPException:
+                logging.warning("[Heatmap Cmd] Failed to remove/add reaction.")
                 pass
 
 async def setup(bot: commands.Bot):

@@ -68,49 +68,66 @@ def create_heatmap(data: pd.DataFrame, title: str, color_map="viridis", annot=Tr
     figsize_x = max(10, len(data.columns) * 0.8)
     figsize_y = max(8, len(data.index) * 0.6)
     
+    logging.debug(f"[Create Heatmap - {title}] Starting plot generation...")
     try:
         # Use plt.figure within the try block
+        logging.debug(f"[Create Heatmap - {title}] Creating figure...")
         plt.figure(figsize=(figsize_x, figsize_y))
+        logging.debug(f"[Create Heatmap - {title}] Figure created.")
         
         # Suppress warnings specifically during seaborn plotting
+        logging.debug(f"[Create Heatmap - {title}] Calling sns.heatmap...")
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=UserWarning)
             sns.heatmap(data, annot=annot, fmt=fmt, cmap=color_map, linewidths=.5, square=False)
+        logging.debug(f"[Create Heatmap - {title}] sns.heatmap call finished.")
             
+        logging.debug(f"[Create Heatmap - {title}] Setting title and ticks...")
         plt.title(title)
         plt.xticks(rotation=45, ha='right') # Improve label readability
         plt.yticks(rotation=0)
+        logging.debug(f"[Create Heatmap - {title}] Title and ticks set.")
         
         # Safely apply tight_layout with fallback
+        logging.debug(f"[Create Heatmap - {title}] Attempting tight_layout...")
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 plt.tight_layout(pad=2.0)  # Add padding
+            logging.debug(f"[Create Heatmap - {title}] tight_layout succeeded.")
         except Exception as layout_error:
             logging.warning(f"Error during tight_layout for heatmap '{title}': {layout_error}")
             plt.subplots_adjust(left=0.1, right=0.9, top=0.9, bottom=0.1)
+            logging.debug(f"[Create Heatmap - {title}] tight_layout failed, applied subplots_adjust.")
 
         buf = io.BytesIO()
+        logging.debug(f"[Create Heatmap - {title}] Attempting to save figure to buffer...")
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+            logging.debug(f"[Create Heatmap - {title}] Saved figure with bbox_inches='tight'.")
         except Exception as save_error:
             logging.warning(f"Error saving heatmap '{title}' with bbox_inches='tight', trying without: {save_error}")
             try:
                  with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     plt.savefig(buf, format='png', dpi=150)
+                 logging.debug(f"[Create Heatmap - {title}] Saved figure without bbox_inches='tight'.")
             except Exception as e:
                 logging.error(f"All attempts to save heatmap '{title}' failed: {e}")
+                logging.debug(f"[Create Heatmap - {title}] All save attempts failed.")
                 return None
             
         buf.seek(0)
+        logging.debug(f"[Create Heatmap - {title}] Figure saved to buffer successfully.")
         return buf
     except Exception as e:
         logging.error(f"Error generating heatmap '{title}': {e}", exc_info=True)
+        logging.debug(f"[Create Heatmap - {title}] Caught exception during generation.")
         return None
     finally:
+        logging.debug(f"[Create Heatmap - {title}] Closing plot figure.")
         plt.close() # Close the plot to free memory
 
 async def generate_co_occurrence_heatmap(guild: discord.Guild, co_occurrence_data: dict, relative: bool = False) -> io.BytesIO | None:
@@ -124,18 +141,21 @@ async def generate_co_occurrence_heatmap(guild: discord.Guild, co_occurrence_dat
     Returns:
         io.BytesIO | None: A BytesIO object containing the PNG image data, or None if error/no data.
     """
+    logging.info(f"[Generate Heatmap] Starting for guild {guild.id} (Relative: {relative})")
     if not co_occurrence_data or not isinstance(co_occurrence_data, dict):
-        logging.warning(f"Invalid or empty co_occurrence_data provided for guild {guild.id}. Type: {type(co_occurrence_data)}")
+        logging.warning(f"[Generate Heatmap] Invalid or empty co_occurrence_data provided for guild {guild.id}. Type: {type(co_occurrence_data)}")
         return None
 
     # --- Defensive Data Extraction --- 
+    logging.debug("[Generate Heatmap] Starting defensive data extraction...")
     processed_pairs = []
     member_ids_with_data = set()
     total_times = defaultdict(float) # For relative calculation
 
     for key, duration in co_occurrence_data.items():
+        # Minimal logging inside the loop to avoid spam, focus on warnings/errors
         if not isinstance(key, tuple) or len(key) != 2:
-            logging.warning(f"Skipping invalid key in co_occurrence_data for guild {guild.id}: {key} (type: {type(key)}) ")
+            logging.warning(f"[Generate Heatmap] Skipping invalid key in co_occurrence_data: {key} (type: {type(key)}) ")
             continue
         try:
             m1_id, m2_id = int(key[0]), int(key[1])
@@ -146,44 +166,50 @@ async def generate_co_occurrence_heatmap(guild: discord.Guild, co_occurrence_dat
             processed_pairs.append(((m1_id, m2_id), duration_float))
             member_ids_with_data.add(m1_id)
             member_ids_with_data.add(m2_id)
-            # Accumulate total time for relative calculation
             total_times[m1_id] += duration_float
             total_times[m2_id] += duration_float
             
         except (ValueError, TypeError) as e:
-            logging.warning(f"Skipping invalid data entry in co_occurrence_data for guild {guild.id}: Key={key}, Duration={duration}. Error: {e}")
+            logging.warning(f"[Generate Heatmap] Skipping invalid data entry: Key={key}, Duration={duration}. Error: {e}")
             continue
             
     if not processed_pairs:
-        logging.info(f"No valid co-occurrence pairs found after processing for guild {guild.id}.")
+        logging.info(f"[Generate Heatmap] No valid co-occurrence pairs found after processing for guild {guild.id}.")
         return None
+    logging.info(f"[Generate Heatmap] Defensive data extraction complete. Found {len(processed_pairs)} valid pairs involving {len(member_ids_with_data)} unique member IDs.")
     # --- End Defensive Data Extraction ---
 
     # Fetch members efficiently once
+    logging.debug("[Generate Heatmap] Fetching guild members...")
     try:
         await guild.chunk()
         members_map = {m.id: m for m in guild.members}
+        logging.debug(f"[Generate Heatmap] Fetched {len(members_map)} members.")
     except Exception as e:
-        logging.warning(f"Error while chunking guild {guild.id} for heatmap: {e}")
+        logging.warning(f"[Generate Heatmap] Error while chunking guild {guild.id} for heatmap: {e}")
         members_map = {m.id: m for m in guild.members}
         if not members_map:
-             logging.error(f"No members found in cache for guild {guild.id}. Cannot generate heatmap.")
+             logging.error(f"[Generate Heatmap] No members found in cache for guild {guild.id}. Cannot generate heatmap.")
              return None
+        logging.debug(f"[Generate Heatmap] Using {len(members_map)} cached members.")
 
     active_member_ids = sorted([mid for mid in member_ids_with_data if mid in members_map])
     member_names = {mid: get_preferred_name(members_map[mid]) for mid in active_member_ids}
+    logging.debug(f"[Generate Heatmap] Found {len(active_member_ids)} active members with data.")
 
     matrix_size = len(active_member_ids)
     if matrix_size < 2:
-        logging.info(f"Not enough active members ({matrix_size}) with co-occurrence data in guild {guild.id}.")
+        logging.info(f"[Generate Heatmap] Not enough active members ({matrix_size}) with co-occurrence data in guild {guild.id}.")
         return None
 
+    logging.debug(f"[Generate Heatmap] Creating matrix of size {matrix_size}x{matrix_size}...")
     matrix = np.zeros((matrix_size, matrix_size))
 
     # Create a lookup for the processed pairs
     processed_pairs_dict = {tuple(sorted(pair)): dur for pair, dur in processed_pairs}
 
     # Populate matrix using active_member_ids index
+    logging.debug("[Generate Heatmap] Populating matrix...")
     for i, m1_id in enumerate(active_member_ids):
         for j, m2_id in enumerate(active_member_ids):
             if i == j:
@@ -191,34 +217,40 @@ async def generate_co_occurrence_heatmap(guild: discord.Guild, co_occurrence_dat
             pair_key = tuple(sorted((m1_id, m2_id)))
             duration_seconds = processed_pairs_dict.get(pair_key, 0.0)
             matrix[i, j] = duration_seconds / 3600.0 # Convert to hours
+    logging.debug("[Generate Heatmap] Matrix populated (absolute hours).")
 
     if relative:
+        logging.debug("[Generate Heatmap] Calculating relative matrix...")
         relative_matrix = np.zeros((matrix_size, matrix_size))
         for i, m1_id in enumerate(active_member_ids):
-            # Use total_times calculated during initial processing
             m1_total = total_times.get(m1_id, 0.0) 
             for j, m2_id in enumerate(active_member_ids):
                 if i == j or m1_total == 0:
                     continue
                 pair_key = tuple(sorted((m1_id, m2_id)))
                 duration_seconds = processed_pairs_dict.get(pair_key, 0.0)
-                # Calculate relative percentage against the specific member's total co-occurrence time
                 relative_matrix[i, j] = (duration_seconds / m1_total) * 100 if m1_total > 0 else 0
                 
         matrix = relative_matrix
         title = f'{guild.name} 成员共同在线时间比例 (%)'
         fmt = ".1f"
         color_map = "plasma"
+        logging.debug("[Generate Heatmap] Relative matrix calculation complete.")
     else:
         title = f'{guild.name} 成员共同在线时长 (小时)'
         fmt = ".1f"
         color_map = "rocket_r"
 
     active_member_names_list = [member_names[mid] for mid in active_member_ids]
+    logging.debug("[Generate Heatmap] Creating Pandas DataFrame...")
     df = pd.DataFrame(matrix, index=active_member_names_list, columns=active_member_names_list)
+    logging.debug("[Generate Heatmap] DataFrame created. Shape: {}".format(df.shape))
 
     # Heatmap function now handles empty check
-    return create_heatmap(df, title, color_map=color_map, fmt=fmt, annot=True if len(df) <= 20 else False)
+    logging.info("[Generate Heatmap] Calling create_heatmap function...")
+    heatmap_result = create_heatmap(df, title, color_map=color_map, fmt=fmt, annot=True if len(df) <= 20 else False)
+    logging.info("[Generate Heatmap] create_heatmap call finished.")
+    return heatmap_result
 
 async def generate_periodic_chart(guild: discord.Guild, voice_stats_data: dict, period: str) -> io.BytesIO | None:
     """Generates a bar chart for voice activity over a specific period.
