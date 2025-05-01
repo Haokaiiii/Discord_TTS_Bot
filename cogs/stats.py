@@ -319,21 +319,21 @@ class StatsCog(commands.Cog):
 
         scheduler = AsyncIOScheduler(timezone=timezone('Australia/Sydney'))
 
-        # --- Reset Periodic Stats --- (Run slightly before the reports)
-        scheduler.add_job(self.reset_periodic_stats, CronTrigger(hour=2, minute=1), args=['daily'], id='reset_daily', replace_existing=True)
-        scheduler.add_job(self.reset_periodic_stats, CronTrigger(day_of_week='mon', hour=2, minute=1), args=['weekly'], id='reset_weekly', replace_existing=True)
-        scheduler.add_job(self.reset_periodic_stats, CronTrigger(day=1, hour=2, minute=1), args=['monthly'], id='reset_monthly', replace_existing=True)
-        scheduler.add_job(self.reset_periodic_stats, CronTrigger(month=1, day=1, hour=2, minute=1), args=['yearly'], id='reset_yearly', replace_existing=True)
-        
-        # --- Periodic Stat Reports ---
-        scheduler.add_job(self.send_periodic_report, CronTrigger(hour=2, minute=5), args=['daily'], id='daily_report', replace_existing=True)
-        scheduler.add_job(self.send_periodic_report, CronTrigger(day_of_week='mon', hour=2, minute=10), args=['weekly'], id='weekly_report', replace_existing=True)
-        scheduler.add_job(self.send_periodic_report, CronTrigger(day=1, hour=2, minute=15), args=['monthly'], id='monthly_report', replace_existing=True)
-        scheduler.add_job(self.send_periodic_report, CronTrigger(month=1, day=1, hour=2, minute=20), args=['yearly'], id='yearly_report', replace_existing=True)
+        # --- Periodic Stat Reports --- (Run BEFORE resetting stats)
+        scheduler.add_job(self.send_periodic_report, CronTrigger(hour=2, minute=0), args=['daily'], id='daily_report', replace_existing=True)
+        scheduler.add_job(self.send_periodic_report, CronTrigger(day_of_week='mon', hour=2, minute=0), args=['weekly'], id='weekly_report', replace_existing=True)
+        scheduler.add_job(self.send_periodic_report, CronTrigger(day=1, hour=2, minute=0), args=['monthly'], id='monthly_report', replace_existing=True)
+        scheduler.add_job(self.send_periodic_report, CronTrigger(month=1, day=1, hour=2, minute=0), args=['yearly'], id='yearly_report', replace_existing=True)
         
         # --- Daily Co-occurrence Heatmap Report ---
-        scheduler.add_job(self.send_daily_heatmap_report, CronTrigger(hour=2, minute=25), id='daily_heatmap', replace_existing=True)
-
+        scheduler.add_job(self.send_daily_heatmap_report, CronTrigger(hour=2, minute=15), id='daily_heatmap', replace_existing=True)
+        
+        # --- Reset Periodic Stats --- (Run AFTER the reports)
+        scheduler.add_job(self.reset_periodic_stats, CronTrigger(hour=2, minute=30), args=['daily'], id='reset_daily', replace_existing=True)
+        scheduler.add_job(self.reset_periodic_stats, CronTrigger(day_of_week='mon', hour=2, minute=30), args=['weekly'], id='reset_weekly', replace_existing=True)
+        scheduler.add_job(self.reset_periodic_stats, CronTrigger(day=1, hour=2, minute=30), args=['monthly'], id='reset_monthly', replace_existing=True)
+        scheduler.add_job(self.reset_periodic_stats, CronTrigger(month=1, day=1, hour=2, minute=30), args=['yearly'], id='reset_yearly', replace_existing=True)
+        
         scheduler.start()
         logging.info("Report scheduler started with jobs.")
         self.bot.report_scheduler = scheduler # Store for potential shutdown
