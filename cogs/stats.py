@@ -398,6 +398,44 @@ class StatsCog(commands.Cog):
                          )
                          continue
 
+                    # Filter stats for the period, excluding those with 0 time
+                    period_stats = {
+                        mid: stats
+                        for mid, stats in guild_stats.items()
+                        if stats.get(period, 0) > 0
+                    }
+                    
+                    # For daily reports, if no activity found, show users with recent weekly activity
+                    if not period_stats and period == 'daily':
+                        logging.info(f"No daily activity found for guild {guild_id}. Checking weekly activity instead.")
+                        period_stats = {
+                            mid: stats
+                            for mid, stats in guild_stats.items()
+                            if stats.get('weekly', 0) > 0
+                        }
+                        
+                        # If still no activity, try total stats
+                        if not period_stats:
+                            logging.info(f"No weekly activity found for guild {guild_id}. Checking total activity instead.")
+                            period_stats = {
+                                mid: stats
+                                for mid, stats in guild_stats.items()
+                                if stats.get('total', 0) > 0
+                            }
+                            
+                            # Use the 'total' values for the report
+                            if period_stats:
+                                logging.info(f"Using total stats for daily report in guild {guild_id}.")
+                                period = 'total'  # Change the period for chart generation
+                    
+                    if not period_stats:
+                         logging.info(f"No activity found for any period in guild {guild_id}. Skipping report.")
+                         await send_to_command_channel(
+                             self.bot, guild_id,
+                             content=f"{period.capitalize()} 语音活动报告：本时段内无成员在线。"
+                         )
+                         continue
+
                     chart_buffer = await generate_periodic_chart(guild, period_stats, period)
 
                     if chart_buffer:
