@@ -752,14 +752,14 @@ class StatsCog(commands.Cog):
         """
         guild = ctx.guild
         if not guild:
-            await send_to_command_channel(ctx, "此命令只能在服务器中使用。")
+            await ctx.send("此命令只能在服务器中使用。")
             return
 
         logging.info(f"[Heatmap Cmd] Received command from {ctx.author.name} in guild {guild.name} ({guild.id}) with mode: {mode}")
 
         guild_co_occurrence = self.co_occurrence_stats.get(guild.id, {})
         if not guild_co_occurrence:
-            await send_to_command_channel(ctx, "此服务器尚无共同在线数据。")
+            await ctx.send("此服务器尚无共同在线数据。")
             logging.info(f"[Heatmap Cmd] No co-occurrence data for guild {guild.id}.")
             return
 
@@ -771,8 +771,11 @@ class StatsCog(commands.Cog):
             for mem_id, periods in guild_voice_stats.items()
         }
 
-        if not member_total_voice_stats and mode.lower() in ['relative', 'both']:\n            await send_to_command_channel(ctx, "无法生成相对热力图，因为没有成员语音时长统计数据。")\n            # If only relative was requested, and no stats, then exit early\n            if mode.lower() == \'relative\':\n                return
-
+        if not member_total_voice_stats and mode.lower() in ['relative', 'both']:
+            await ctx.send("无法生成相对热力图，因为没有成员语音时长统计数据。")
+            # If only relative was requested, and no stats, then exit early
+            if mode.lower() == 'relative':
+                return
 
         files_to_send = []
         error_occurred_abs = False
@@ -799,7 +802,12 @@ class StatsCog(commands.Cog):
                     logging.warning(f"[Heatmap Cmd] Failed to generate absolute heatmap for guild {guild.id} (buffer was None).")
 
             if mode.lower() == 'relative' or mode.lower() == 'both':
-                if not member_total_voice_stats:\n                    logging.warning(f"[Heatmap Cmd] Skipping relative heatmap for guild {guild.id} as member_total_voice_stats is empty.")\n                    if mode.lower() != \'both\': # If 'relative' was the only mode, inform user\n                         await send_to_command_channel(ctx, "无法生成相对热力图，因为没有成员语音时长统计数据。")\n                else:\n                    logging.info(f"[Heatmap Cmd] Generating relative heatmap for guild {guild.id}...")
+                if not member_total_voice_stats:
+                    logging.warning(f"[Heatmap Cmd] Skipping relative heatmap for guild {guild.id} as member_total_voice_stats is empty.")
+                    if mode.lower() != 'both': # If 'relative' was the only mode, inform user
+                         await ctx.send("无法生成相对热力图，因为没有成员语音时长统计数据。")
+                else:
+                    logging.info(f"[Heatmap Cmd] Generating relative heatmap for guild {guild.id}...")
                     rel_heatmap_buffer = await generate_co_occurrence_heatmap(
                         guild,
                         guild_co_occurrence,
@@ -815,11 +823,23 @@ class StatsCog(commands.Cog):
 
             if files_to_send:
                 logging.info(f"[Heatmap Cmd] Sending {len(files_to_send)} heatmap(s) to channel {ctx.channel.id} for guild {guild.id}.")
-                await send_to_command_channel(ctx, files=files_to_send)
-            elif not error_occurred_abs and not error_occurred_rel and mode.lower() not in ['absolute', 'relative', 'both']:\n                # This case handles invalid mode.
-                await send_to_command_channel(ctx, f"无法识别的模式 '{mode}'。请使用 'absolute', 'relative', 或 'both'。")
+                await ctx.send(files=files_to_send)
+            elif not error_occurred_abs and not error_occurred_rel and mode.lower() not in ['absolute', 'relative', 'both']:
+                # This case handles invalid mode.
+                await ctx.send(f"无法识别的模式 '{mode}'。请使用 'absolute', 'relative', 或 'both'。")
                 logging.warning(f"[Heatmap Cmd] Invalid mode '{mode}' provided for guild {guild.id}.")
-            elif error_occurred_abs and (mode.lower() == 'absolute' or (mode.lower() == 'both' and not files_to_send)):\n                await send_to_command_channel(ctx, "无法生成绝对共同在线热力图 (可能没有足够的数据或遇到错误)。")\n            elif error_occurred_rel and (mode.lower() == 'relative' or (mode.lower() == 'both' and not files_to_send)):\n                await send_to_command_channel(ctx, "无法生成相对共同在线热力图 (可能没有足够的数据、成员时长统计或遇到错误)。")\n            elif mode.lower() == 'both' and (error_occurred_abs or error_occurred_rel) and not files_to_send:\n                 await send_to_command_channel(ctx, "生成热力图时发生错误。")\n            elif not files_to_send and (error_occurred_abs or error_occurred_rel):\n                # If some error occurred but it wasn't caught by specific messages above (e.g. one part of 'both' failed but other succeeded)\n                # and no files were sent at all. This is a fallback.\n                logging.info(f"[Heatmap Cmd] No files to send and some error occurred for guild {guild.id}.") # Already logged specific errors\n            # If no files to send but also no errors reported (e.g. invalid mode already handled)\n            # or if one part of 'both' succeeded and was sent, no further message needed here.
+            elif error_occurred_abs and (mode.lower() == 'absolute' or (mode.lower() == 'both' and not files_to_send)):
+                await ctx.send("无法生成绝对共同在线热力图 (可能没有足够的数据或遇到错误)。")
+            elif error_occurred_rel and (mode.lower() == 'relative' or (mode.lower() == 'both' and not files_to_send)):
+                await ctx.send("无法生成相对共同在线热力图 (可能没有足够的数据、成员时长统计或遇到错误)。")
+            elif mode.lower() == 'both' and (error_occurred_abs or error_occurred_rel) and not files_to_send:
+                 await ctx.send("生成热力图时发生错误。")
+            elif not files_to_send and (error_occurred_abs or error_occurred_rel):
+                # If some error occurred but it wasn't caught by specific messages above (e.g. one part of 'both' failed but other succeeded)
+                # and no files were sent at all. This is a fallback.
+                logging.info(f"[Heatmap Cmd] No files to send and some error occurred for guild {guild.id}.") # Already logged specific errors
+            # If no files to send but also no errors reported (e.g. invalid mode already handled)
+            # or if one part of 'both' succeeded and was sent, no further message needed here.
 
 
         except Exception as e:
