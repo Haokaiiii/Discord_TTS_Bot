@@ -328,6 +328,9 @@ class StatsCog(commands.Cog):
         # --- Daily Co-occurrence Heatmap Report ---
         scheduler.add_job(self.send_daily_heatmap_report, CronTrigger(hour=2, minute=15), id='daily_heatmap', replace_existing=True)
         
+        # --- Weekly Relationship Network Graph Report ---
+        scheduler.add_job(self.send_weekly_relationship_graph_report, CronTrigger(day_of_week='mon', hour=2, minute=5), id='weekly_relationship_graph', replace_existing=True)
+        
         # --- Reset Periodic Stats --- (Run AFTER the reports)
         scheduler.add_job(self.reset_periodic_stats, CronTrigger(hour=2, minute=30), args=['daily'], id='reset_daily', replace_existing=True)
         scheduler.add_job(self.reset_periodic_stats, CronTrigger(day_of_week='mon', hour=2, minute=30), args=['weekly'], id='reset_weekly', replace_existing=True)
@@ -473,11 +476,15 @@ class StatsCog(commands.Cog):
         await self.bot.wait_until_ready() # Ensure bot is connected
 
         # Make sure stats are saved before generating report
-        await self.save_stats()
-        await asyncio.sleep(2) # Small delay to ensure save completes
+        current_voice_stats = self.voice_stats.copy() # Work with a consistent copy
+        current_co_occurrence_stats = self.co_occurrence_stats.copy()
 
-        # Consider reloading co-occurrence stats from DB for consistency?
-        # Using in-memory stats for now.
+        # It might be better to explicitly save and then reload for true point-in-time, 
+        # but for daily reports, current in-memory data (reset daily) should be fine.
+        # await self.save_stats() 
+        # await asyncio.sleep(2) # Small delay to ensure save completes
+        # current_voice_stats = self.db_manager.load_voice_stats()
+        # current_co_occurrence_stats = self.db_manager.load_co_occurrence_stats()
 
         try:
             for guild in self.bot.guilds:
@@ -485,18 +492,39 @@ class StatsCog(commands.Cog):
                 logging.info(f"Generating daily heatmap report for guild {guild.name} ({guild_id})")
 
                 try:
-                    guild_co_occurrence = self.co_occurrence_stats.get(guild_id)
+                    guild_co_occurrence = current_co_occurrence_stats.get(guild_id)
                     if not guild_co_occurrence:
                         logging.info(f"No co-occurrence data for guild {guild_id}. Skipping daily heatmap report.")
-                        # Optionally send a message? 
-                        # await send_to_command_channel(self.bot, guild_id, content="每日关系热力图：无数据可生成。")
                         continue
 
-                    # Generate absolute heatmap
-                    abs_heatmap_buffer = await generate_co_occurrence_heatmap(guild, guild_co_occurrence, relative=False)
-                    
-                    # Generate relative heatmap
-                    rel_heatmap_buffer = await generate_co_occurrence_heatmap(guild, guild_co_occurrence, relative=True)
+                    # Prepare daily total voice stats for the relative heatmap denominator
+                    guild_voice_stats = current_voice_stats.get(guild_id, {})
+                    member_daily_total_voice_seconds = {
+                        member_id: stats.get('daily', 0.0)
+                        for member_id, stats in guild_voice_stats.items()
+                        if stats.get('daily', 0.0) > 0 # Only include members with some daily activity
+                    }
+
+                    if not member_daily_total_voice_seconds:
+                        logging.info(f"No members with daily voice activity in guild {guild_id} for relative heatmap. Skipping relative heatmap.")
+                        # Still try to generate absolute heatmap
+                        rel_heatmap_buffer = None
+                    else:
+                        # Generate relative heatmap
+                        rel_heatmap_buffer = await generate_co_occurrence_heatmap(
+                            guild, 
+                            guild_co_occurrence, 
+                            member_daily_total_voice_seconds, # Pass the correct daily stats
+                            relative=True
+                        )
+
+                    # Generate absolute heatmap (does not need member_period_voice_stats)
+                    abs_heatmap_buffer = await generate_co_occurrence_heatmap(
+                        guild, 
+                        guild_co_occurrence, 
+                        {}, # Pass empty dict as it's not used for absolute
+                        relative=False
+                    )
 
                     # Send both heatmaps if available
                     if abs_heatmap_buffer:
@@ -545,6 +573,75 @@ class StatsCog(commands.Cog):
                         logging.error(f"Failed to send error message to guild {guild_id}")
         except Exception as e:
             logging.error(f"Critical error in daily heatmap report task: {e}", exc_info=True)
+
+    async def send_weekly_relationship_graph_report(self):
+        """Generates and sends the weekly relationship network graph to each guild."""
+        logging.info("Generating Weekly Relationship Network Graph reports for all guilds.")
+        await self.bot.wait_until_ready()
+
+        current_voice_stats = self.voice_stats.copy()
+        current_co_occurrence_stats = self.co_occurrence_stats.copy()
+
+        # Consider if co_occurrence_stats needs to be filtered or handled for a weekly view.
+        # Currently, it's a running total, reset implicitly if users become inactive over time.
+        # For weekly_stats for the graph, we specifically use the 'weekly' period from voice_stats.
+
+        try:
+            for guild in self.bot.guilds:
+                guild_id = guild.id
+                logging.info(f"Generating weekly relationship graph for guild {guild.name} ({guild_id})")
+
+                try:
+                    guild_co_occurrence = current_co_occurrence_stats.get(guild_id)
+                    if not guild_co_occurrence:
+                        logging.info(f"No co-occurrence data for guild {guild_id}. Skipping weekly relationship graph.")
+                        continue
+
+                    guild_voice_stats = current_voice_stats.get(guild_id, {})
+                    member_weekly_total_voice_seconds = {
+                        member_id: stats.get('weekly', 0.0)
+                        for member_id, stats in guild_voice_stats.items()
+                        if stats.get('weekly', 0.0) > 60 # Min 1 minute of weekly activity to be included in weekly_stats for graph
+                    }
+
+                    if not member_weekly_total_voice_seconds:
+                        logging.info(f"No members with sufficient weekly voice activity in guild {guild_id}. Skipping weekly relationship graph.")
+                        continue
+
+                    graph_buffer = await generate_relationship_network_graph(
+                        guild,
+                        guild_co_occurrence, # Use all available co-occurrence data
+                        member_weekly_total_voice_seconds # Pass weekly stats for node selection enhancement
+                    )
+
+                    if graph_buffer:
+                        report_title = f"{guild.name} 每周成员关系网络图"
+                        embed = discord.Embed(title=report_title, color=discord.Color.purple())
+                        embed.description = "该图展示了本周共同在线较多的成员以及周活跃成员间的关系。"
+                        embed.set_image(url="attachment://weekly_relationship_graph.png")
+                        embed.timestamp = datetime.now()
+                        embed.set_footer(text="此报告每周自动生成")
+
+                        file = discord.File(graph_buffer, filename="weekly_relationship_graph.png")
+                        await send_to_command_channel(self.bot, guild_id, embed=embed, file=file)
+                        logging.info(f"Sent weekly relationship graph for guild {guild_id}")
+                    else:
+                        logging.warning(f"Failed to generate weekly relationship graph for guild {guild_id}. It might be due to insufficient data (e.g. <2 users). Check plotting logs.")
+                        # Optionally send a message that graph couldn't be generated if desired
+                        # await send_to_command_channel(self.bot, guild_id, content="本周成员关系网络图：无足够数据生成。")
+
+                except Exception as e:
+                    logging.error(f"Error processing weekly relationship graph for guild {guild_id}: {e}", exc_info=True)
+                    try:
+                        await send_to_command_channel(
+                            self.bot, guild_id,
+                            content=f"生成每周成员关系网络图时发生错误: {str(e)[:100]}..."
+                        )
+                    except Exception as e_send:
+                        logging.error(f"Failed to send error message for weekly graph to guild {guild_id}: {e_send}")
+
+        except Exception as e:
+            logging.error(f"Critical error in weekly relationship graph report task: {e}", exc_info=True)
 
     # --- Commands --- 
 
@@ -646,114 +743,87 @@ class StatsCog(commands.Cog):
     @commands.command(name='heatmap', aliases=['heat', 'matrix'], brief="显示成员共同在线时长热力图 (模式: abs/rel/both)。")
     @check_channel()
     async def show_heatmap(self, ctx: commands.Context, mode: str = 'absolute'):
-        """显示成员共同在线时长热力图。
-        
-        参数:
-            mode: 热力图模式 
-                'absolute'/'abs' (默认): 显示绝对共同在线时长（小时）
-                'relative'/'rel': 显示相对共同在线时间百分比
-                'both': 同时显示绝对和相对两种热力图
+        """
+        Generates and displays a co-occurrence heatmap.
+        Modes:
+        - 'absolute' or 'abs': Shows absolute time spent together.
+        - 'relative' or 'rel': Shows time spent together relative to total time in voice for one of the members.
+        - 'both': Shows both absolute and relative heatmaps.
         """
         guild = ctx.guild
         if not guild:
-            await ctx.send("此命令只能在服务器内使用。")
+            await send_to_command_channel(ctx, "此命令只能在服务器中使用。")
             return
-        
-        logging.info(f"[Heatmap Cmd] Received heatmap command for guild {guild.id} (Mode: {mode})")
 
-        await ctx.message.add_reaction('⏳')
+        logging.info(f"[Heatmap Cmd] Received command from {ctx.author.name} in guild {guild.name} ({guild.id}) with mode: {mode}")
 
-        logging.debug("[Heatmap Cmd] Fetching co-occurrence data...")
-        guild_co_occurrence = self.co_occurrence_stats.get(guild.id)
-
+        guild_co_occurrence = self.co_occurrence_stats.get(guild.id, {})
         if not guild_co_occurrence:
-            logging.warning(f"[Heatmap Cmd] No co-occurrence data found for guild {guild.id}")
-            await ctx.send("尚未记录此服务器的共同在线数据。")
-            try:
-                await ctx.message.remove_reaction('⏳', self.bot.user)
-            except discord.HTTPException:
-                pass
+            await send_to_command_channel(ctx, "此服务器尚无共同在线数据。")
+            logging.info(f"[Heatmap Cmd] No co-occurrence data for guild {guild.id}.")
             return
-        
-        logging.debug(f"[Heatmap Cmd] Co-occurrence data fetched. Count: {len(guild_co_occurrence)} pairs. Preparing to generate...")
 
-        # Process mode parameter
-        mode = mode.lower()
-        show_absolute = mode in ['absolute', 'abs', 'both']
-        show_relative = mode in ['relative', 'rel', 'both']
-        
-        # If invalid mode, default to absolute
-        if not show_absolute and not show_relative:
-            show_absolute = True
-            await ctx.send("未知的模式选项。使用默认的绝对时间模式。\n有效选项: `absolute`/`abs`, `relative`/`rel`, `both`", delete_after=10)
+        # Prepare member_period_voice_stats using 'total' voice time
+        # This will be used for both absolute (as a required arg) and relative calculations
+        guild_voice_stats = self.voice_stats.get(guild.id, {})
+        member_total_voice_stats = {
+            mem_id: periods.get('total', 0)
+            for mem_id, periods in guild_voice_stats.items()
+        }
+
+        if not member_total_voice_stats and mode.lower() in ['relative', 'both']:\n            await send_to_command_channel(ctx, "无法生成相对热力图，因为没有成员语音时长统计数据。")\n            # If only relative was requested, and no stats, then exit early\n            if mode.lower() == \'relative\':\n                return
+
+
+        files_to_send = []
+        error_occurred_abs = False
+        error_occurred_rel = False
+
+        # Defer the response to indicate the bot is working
+        await ctx.defer()
+        logging.debug(f"[Heatmap Cmd] Deferred response for guild {guild.id}.")
 
         try:
-            # Generate requested heatmaps
-            abs_heatmap_buffer = None
-            rel_heatmap_buffer = None
-            
-            if show_absolute:
-                logging.info("[Heatmap Cmd] Generating absolute heatmap...")
-                abs_heatmap_buffer = await generate_co_occurrence_heatmap(guild, guild_co_occurrence, relative=False)
-                logging.info("[Heatmap Cmd] Absolute heatmap generation finished.")
-                
-            if show_relative: 
-                logging.info("[Heatmap Cmd] Generating relative heatmap...")
-                rel_heatmap_buffer = await generate_co_occurrence_heatmap(guild, guild_co_occurrence, relative=True)
-                logging.info("[Heatmap Cmd] Relative heatmap generation finished.")
-            
-            # Send absolute heatmap if requested and available
-            if show_absolute and abs_heatmap_buffer:
-                logging.debug("[Heatmap Cmd] Sending absolute heatmap...")
-                abs_title = f"{guild.name} 成员共同在线时长热力图"
-                abs_description = "热力图显示每位成员与其他成员共同在线的绝对时长（小时）。"
-                abs_filename = "co_occurrence_abs.png"
-                
-                abs_embed = discord.Embed(title=abs_title, color=discord.Color.orange())
-                abs_embed.description = abs_description
-                abs_embed.set_image(url=f"attachment://{abs_filename}")
-                abs_embed.timestamp = datetime.now()
-                abs_file = discord.File(abs_heatmap_buffer, filename=abs_filename)
-                
-                await ctx.send(embed=abs_embed, file=abs_file)
-                logging.info(f"[Heatmap Cmd] Absolute heatmap sent for guild {guild.id}.")
-            
-            # Send relative heatmap if requested and available
-            if show_relative and rel_heatmap_buffer:
-                # Add a slight delay between messages to avoid rate limiting
-                if show_absolute and abs_heatmap_buffer:
-                    await asyncio.sleep(1)
-                
-                logging.debug("[Heatmap Cmd] Sending relative heatmap...")
-                rel_title = f"{guild.name} 成员共同在线时间比例热力图"
-                rel_description = "热力图显示每位成员与其他成员共同在线的时间占该成员总在线时间的百分比。"
-                rel_filename = "co_occurrence_rel.png"
-                
-                rel_embed = discord.Embed(title=rel_title, color=discord.Color.blue())
-                rel_embed.description = rel_description
-                rel_embed.set_image(url=f"attachment://{rel_filename}")
-                rel_embed.timestamp = datetime.now()
-                rel_file = discord.File(rel_heatmap_buffer, filename=rel_filename)
-                
-                await ctx.send(embed=rel_embed, file=rel_file)
-                logging.info(f"[Heatmap Cmd] Relative heatmap sent for guild {guild.id}.")
-            
-            # If all requested heatmaps failed
-            if (show_absolute and not abs_heatmap_buffer) and (show_relative and not rel_heatmap_buffer):
-                logging.warning("[Heatmap Cmd] All requested heatmaps failed to generate.")
-                await ctx.send("生成热力图时出错或没有足够的数据。热力图需要至少两位成员有共同在线记录。")
-                
+            if mode.lower() == 'absolute' or mode.lower() == 'both':
+                logging.info(f"[Heatmap Cmd] Generating absolute heatmap for guild {guild.id}...")
+                abs_heatmap_buffer = await generate_co_occurrence_heatmap(
+                    guild,
+                    guild_co_occurrence,
+                    member_total_voice_stats, # Pass the prepared stats
+                    relative=False
+                )
+                if abs_heatmap_buffer:
+                    files_to_send.append(discord.File(abs_heatmap_buffer, filename="absolute_co_occurrence_heatmap.png"))
+                    logging.info(f"[Heatmap Cmd] Absolute heatmap generated successfully for guild {guild.id}.")
+                else:
+                    error_occurred_abs = True
+                    logging.warning(f"[Heatmap Cmd] Failed to generate absolute heatmap for guild {guild.id} (buffer was None).")
+
+            if mode.lower() == 'relative' or mode.lower() == 'both':
+                if not member_total_voice_stats:\n                    logging.warning(f"[Heatmap Cmd] Skipping relative heatmap for guild {guild.id} as member_total_voice_stats is empty.")\n                    if mode.lower() != \'both\': # If 'relative' was the only mode, inform user\n                         await send_to_command_channel(ctx, "无法生成相对热力图，因为没有成员语音时长统计数据。")\n                else:\n                    logging.info(f"[Heatmap Cmd] Generating relative heatmap for guild {guild.id}...")
+                    rel_heatmap_buffer = await generate_co_occurrence_heatmap(
+                        guild,
+                        guild_co_occurrence,
+                        member_total_voice_stats, # Pass the prepared stats
+                        relative=True
+                    )
+                    if rel_heatmap_buffer:
+                        files_to_send.append(discord.File(rel_heatmap_buffer, filename="relative_co_occurrence_heatmap.png"))
+                        logging.info(f"[Heatmap Cmd] Relative heatmap generated successfully for guild {guild.id}.")
+                    else:
+                        error_occurred_rel = True
+                        logging.warning(f"[Heatmap Cmd] Failed to generate relative heatmap for guild {guild.id} (buffer was None).")
+
+            if files_to_send:
+                logging.info(f"[Heatmap Cmd] Sending {len(files_to_send)} heatmap(s) to channel {ctx.channel.id} for guild {guild.id}.")
+                await send_to_command_channel(ctx, files=files_to_send)
+            elif not error_occurred_abs and not error_occurred_rel and mode.lower() not in ['absolute', 'relative', 'both']:\n                # This case handles invalid mode.
+                await send_to_command_channel(ctx, f"无法识别的模式 '{mode}'。请使用 'absolute', 'relative', 或 'both'。")
+                logging.warning(f"[Heatmap Cmd] Invalid mode '{mode}' provided for guild {guild.id}.")
+            elif error_occurred_abs and (mode.lower() == 'absolute' or (mode.lower() == 'both' and not files_to_send)):\n                await send_to_command_channel(ctx, "无法生成绝对共同在线热力图 (可能没有足够的数据或遇到错误)。")\n            elif error_occurred_rel and (mode.lower() == 'relative' or (mode.lower() == 'both' and not files_to_send)):\n                await send_to_command_channel(ctx, "无法生成相对共同在线热力图 (可能没有足够的数据、成员时长统计或遇到错误)。")\n            elif mode.lower() == 'both' and (error_occurred_abs or error_occurred_rel) and not files_to_send:\n                 await send_to_command_channel(ctx, "生成热力图时发生错误。")\n            elif not files_to_send and (error_occurred_abs or error_occurred_rel):\n                # If some error occurred but it wasn't caught by specific messages above (e.g. one part of 'both' failed but other succeeded)\n                # and no files were sent at all. This is a fallback.\n                logging.info(f"[Heatmap Cmd] No files to send and some error occurred for guild {guild.id}.") # Already logged specific errors\n            # If no files to send but also no errors reported (e.g. invalid mode already handled)\n            # or if one part of 'both' succeeded and was sent, no further message needed here.
+
+
         except Exception as e:
-            logging.error(f"[Heatmap Cmd] Unexpected error during heatmap command execution: {e}", exc_info=True)
-            await ctx.send(f"生成热力图时发生严重错误: {str(e)[:100]}...")
-        finally:
-            logging.debug("[Heatmap Cmd] Removing reaction...")
-            try:
-                await ctx.message.remove_reaction('⏳', self.bot.user)
-                await ctx.message.add_reaction('✅')
-            except discord.HTTPException:
-                logging.warning("[Heatmap Cmd] Failed to remove/add reaction.")
-                pass
+            logging.error(f"[Heatmap Cmd] Unexpected error during heatmap command execution for guild {guild.id}: {e}", exc_info=True)
 
 async def setup(bot: commands.Bot):
     db_manager = DatabaseManager() # Create instance here

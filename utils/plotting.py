@@ -159,12 +159,18 @@ def create_heatmap(data: pd.DataFrame, title: str, color_map="viridis", annot=Tr
         except Exception as e:
             logging.warning(f"Error closing plot figure for '{title}': {e}")
 
-async def generate_co_occurrence_heatmap(guild: discord.Guild, co_occurrence_data: dict, relative: bool = False) -> io.BytesIO | None:
+async def generate_co_occurrence_heatmap(
+    guild: discord.Guild,
+    co_occurrence_data: dict, # {(m1_id, m2_id): seconds}
+    member_period_voice_stats: dict, # {member_id: period_total_seconds}
+    relative: bool = False
+) -> io.BytesIO | None:
     """Generates a co-occurrence heatmap (absolute or relative) for a guild.
 
     Args:
         guild (discord.Guild): The guild for which to generate the heatmap.
         co_occurrence_data (dict): Dictionary containing co-occurrence duration in seconds {(m1_id, m2_id): seconds}.
+        member_period_voice_stats (dict): Dictionary containing total voice seconds for each member for the relevant period.
         relative (bool): If True, calculates relative co-occurrence time.
 
     Returns:
@@ -174,12 +180,15 @@ async def generate_co_occurrence_heatmap(guild: discord.Guild, co_occurrence_dat
     if not co_occurrence_data or not isinstance(co_occurrence_data, dict):
         logging.warning(f"[Generate Heatmap] Invalid or empty co_occurrence_data provided for guild {guild.id}. Type: {type(co_occurrence_data)}")
         return None
+    
+    if relative and (not member_period_voice_stats or not isinstance(member_period_voice_stats, dict)):
+        logging.warning(f"[Generate Heatmap] Relative heatmap requested but member_period_voice_stats is missing or invalid for guild {guild.id}.")
+        return None
 
-    # --- Defensive Data Extraction --- 
+    # --- Defensive Data Extraction ---
     logging.debug("[Generate Heatmap] Starting defensive data extraction...")
     processed_pairs = []
     member_ids_with_data = set()
-    total_times = defaultdict(float) # For relative calculation
 
     for key, duration in co_occurrence_data.items():
         # Minimal logging inside the loop to avoid spam, focus on warnings/errors
@@ -191,13 +200,11 @@ async def generate_co_occurrence_heatmap(guild: discord.Guild, co_occurrence_dat
             duration_float = float(duration)
             if duration_float <= 0:
                 continue # Skip zero or negative durations
-                
+
             processed_pairs.append(((m1_id, m2_id), duration_float))
             member_ids_with_data.add(m1_id)
             member_ids_with_data.add(m2_id)
-            total_times[m1_id] += duration_float
-            total_times[m2_id] += duration_float
-            
+
         except (ValueError, TypeError) as e:
             logging.warning(f"[Generate Heatmap] Skipping invalid data entry: Key={key}, Duration={duration}. Error: {e}")
             continue
@@ -252,13 +259,14 @@ async def generate_co_occurrence_heatmap(guild: discord.Guild, co_occurrence_dat
         logging.debug("[Generate Heatmap] Calculating relative matrix...")
         relative_matrix = np.zeros((matrix_size, matrix_size))
         for i, m1_id in enumerate(active_member_ids):
-            m1_total = total_times.get(m1_id, 0.0) 
+            m1_total_period_voice_seconds = member_period_voice_stats.get(m1_id, 0.0) # NEW: using actual total voice time for the period
+
             for j, m2_id in enumerate(active_member_ids):
-                if i == j or m1_total == 0:
+                if i == j or m1_total_period_voice_seconds == 0:
                     continue
                 pair_key = tuple(sorted((m1_id, m2_id)))
                 duration_seconds = processed_pairs_dict.get(pair_key, 0.0)
-                relative_matrix[i, j] = (duration_seconds / m1_total) * 100 if m1_total > 0 else 0
+                relative_matrix[i, j] = (duration_seconds / m1_total_period_voice_seconds) * 100 if m1_total_period_voice_seconds > 0 else 0
                 
         matrix = relative_matrix
         title = f'{guild.name} 成员共同在线时间比例 (%)'
