@@ -791,7 +791,7 @@ class StatsCog(commands.Cog):
                 abs_heatmap_buffer = await generate_co_occurrence_heatmap(
                     guild,
                     guild_co_occurrence,
-                    member_total_voice_stats, # Pass the prepared stats
+                    member_total_voice_stats, # Pass the prepared stats for consistency with relative
                     relative=False
                 )
                 if abs_heatmap_buffer:

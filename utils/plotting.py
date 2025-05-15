@@ -290,6 +290,27 @@ async def generate_co_occurrence_heatmap(
         # Sum the values in each row to find the most active members
         row_sums = df.sum(axis=1)
         top_members = row_sums.nlargest(max_members_for_heatmap).index
+        
+        # For relative matrices, we need to ensure consistent users with absolute
+        # Instead of solely using relative percentages, use the underlying co-occurrence data
+        if relative:
+            # Create a temporary absolute matrix
+            absolute_matrix = np.zeros((matrix_size, matrix_size))
+            for i, m1_id in enumerate(active_member_ids):
+                for j, m2_id in enumerate(active_member_ids):
+                    if i == j:
+                        continue
+                    pair_key = tuple(sorted((m1_id, m2_id)))
+                    duration_seconds = processed_pairs_dict.get(pair_key, 0.0)
+                    absolute_matrix[i, j] = duration_seconds / 3600.0  # Convert to hours
+            
+            # Create a DataFrame for this absolute data with same indices as df
+            abs_df = pd.DataFrame(absolute_matrix, index=df.index, columns=df.columns)
+            
+            # Sum values to find most active members (consistent with absolute heatmap)
+            abs_row_sums = abs_df.sum(axis=1)
+            top_members = abs_row_sums.nlargest(max_members_for_heatmap).index
+            
         df = df.loc[top_members, top_members]
         logging.info(f"[Generate Heatmap] Reduced matrix size to {len(df)}x{len(df)}")
 
