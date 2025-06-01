@@ -148,29 +148,35 @@ class DatabaseManager:
                 if not backup_success:
                     logging.warning("Failed to create backup before saving to MongoDB")
                 
-                # Save to MongoDB
+                # Save to MongoDB using individual operations (more reliable than bulk)
                 collection = self.async_db[self.voice_stats_collection]
                 
-                # Use bulk operations for efficiency
-                operations = []
+                success_count = 0
                 for guild_id, members in voice_stats_data.items():
-                    serialized_members = {
-                        str(member_id): stats
-                        for member_id, stats in members.items()
-                    }
-                    operations.append({
-                        'filter': {'guild_id': guild_id},
-                        'update': {'$set': {'members': serialized_members, 'updated_at': datetime.utcnow()}},
-                        'upsert': True
-                    })
+                    try:
+                        serialized_members = {
+                            str(member_id): stats
+                            for member_id, stats in members.items()
+                        }
+                        
+                        result = await collection.update_one(
+                            {'guild_id': guild_id},
+                            {
+                                '$set': {
+                                    'members': serialized_members, 
+                                    'updated_at': datetime.utcnow()
+                                }
+                            },
+                            upsert=True
+                        )
+                        success_count += 1
+                        
+                    except PyMongoError as e:
+                        logging.error(f"Failed to save voice stats for guild {guild_id}: {e}")
+                        continue
                 
-                if operations:
-                    result = await collection.bulk_write([
-                        {'updateOne': op} for op in operations
-                    ])
-                    logging.info(f"Voice stats saved to MongoDB: {result.modified_count} modified, {result.upserted_count} upserted")
-                
-                return True
+                logging.info(f"Voice stats saved to MongoDB: {success_count}/{len(voice_stats_data)} guilds")
+                return success_count > 0
                 
             except PyMongoError as e:
                 logging.error(f"MongoDB error saving voice stats: {e}")
@@ -208,29 +214,35 @@ class DatabaseManager:
                 if not backup_success:
                     logging.warning("Failed to create backup before saving to MongoDB")
                 
-                # Save to MongoDB
+                # Save to MongoDB using individual operations
                 collection = self.async_db[self.co_occurrence_collection]
                 
-                # Use bulk operations
-                operations = []
+                success_count = 0
                 for guild_id, pairs in co_occurrence_data.items():
-                    serialized_pairs = {
-                        f"{m1},{m2}": duration
-                        for (m1, m2), duration in pairs.items()
-                    }
-                    operations.append({
-                        'filter': {'guild_id': guild_id},
-                        'update': {'$set': {'pairs': serialized_pairs, 'updated_at': datetime.utcnow()}},
-                        'upsert': True
-                    })
+                    try:
+                        serialized_pairs = {
+                            f"{m1},{m2}": duration
+                            for (m1, m2), duration in pairs.items()
+                        }
+                        
+                        result = await collection.update_one(
+                            {'guild_id': guild_id},
+                            {
+                                '$set': {
+                                    'pairs': serialized_pairs, 
+                                    'updated_at': datetime.utcnow()
+                                }
+                            },
+                            upsert=True
+                        )
+                        success_count += 1
+                        
+                    except PyMongoError as e:
+                        logging.error(f"Failed to save co-occurrence stats for guild {guild_id}: {e}")
+                        continue
                 
-                if operations:
-                    result = await collection.bulk_write([
-                        {'updateOne': op} for op in operations
-                    ])
-                    logging.info(f"Co-occurrence stats saved to MongoDB: {result.modified_count} modified, {result.upserted_count} upserted")
-                
-                return True
+                logging.info(f"Co-occurrence stats saved to MongoDB: {success_count}/{len(co_occurrence_data)} guilds")
+                return success_count > 0
                 
             except PyMongoError as e:
                 logging.error(f"MongoDB error saving co-occurrence stats: {e}")

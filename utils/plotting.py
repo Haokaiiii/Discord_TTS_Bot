@@ -266,10 +266,18 @@ async def generate_co_occurrence_heatmap(
                     if total_time > 0:
                         matrix[i, j] = (duration_seconds / total_time) * 100
                 else:
+                    # For absolute heatmaps, make matrix symmetric
                     matrix[i, j] = duration_seconds / 3600  # Convert to hours
     
-    # Create DataFrame
-    member_names = [get_preferred_name(members_map[mid]) for mid in active_members]
+    # Create DataFrame with truncated names to handle long usernames
+    member_names = []
+    for mid in active_members:
+        name = get_preferred_name(members_map[mid])
+        # Truncate very long names to prevent layout issues
+        if len(name) > 15:
+            name = name[:12] + "..."
+        member_names.append(name)
+    
     df = pd.DataFrame(matrix, index=member_names, columns=member_names)
     
     # Limit size if needed
@@ -328,11 +336,15 @@ async def generate_periodic_chart(
             
         if duration_seconds > 60:  # At least 1 minute
             member = members_map.get(member_id)
-            name = get_preferred_name(member) if member else f"用户 {member_id}"
-            data.append({
-                'member': name,
-                'hours': duration_seconds / 3600
-            })
+            if member:  # Only include current guild members for consistency
+                name = get_preferred_name(member)
+                # Truncate very long names to prevent layout issues
+                if len(name) > 20:
+                    name = name[:17] + "..."
+                data.append({
+                    'member': name,
+                    'hours': duration_seconds / 3600
+                })
     
     if not data:
         logging.info(f"No activity data for period {period} in guild {guild.id}")
@@ -378,29 +390,34 @@ async def generate_relationship_network_graph(
     co_occurrence_data: Dict[Tuple[int, int], float],
     weekly_stats: Dict[int, float]
 ) -> Optional[io.BytesIO]:
-    """Generate network graph with improved layout algorithm."""
+    """Generate network graph with improved layout algorithm and user selection."""
     if not co_occurrence_data:
         logging.info(f"No co-occurrence data for guild {guild.id}")
         return None
     
-    # Calculate total co-occurrence per user
-    user_totals = Counter()
+    # Calculate total co-occurrence per user (but avoid double-counting pairs)
+    user_pair_counts = Counter()  # Count unique pairs per user
     valid_pairs = {}
     
     for (m1_id, m2_id), duration in co_occurrence_data.items():
         if duration >= 60:  # At least 1 minute
-            user_totals[m1_id] += duration
-            user_totals[m2_id] += duration
+            # Count unique pairs, not total duration to avoid bias toward high-duration pairs
+            user_pair_counts[m1_id] += 1
+            user_pair_counts[m2_id] += 1
             valid_pairs[tuple(sorted((m1_id, m2_id)))] = duration
     
-    # Select top users
-    top_co_occurrence = {uid for uid, _ in user_totals.most_common(10)}
+    # Select top users by number of connections (more balanced than total duration)
+    top_co_occurrence = {uid for uid, _ in user_pair_counts.most_common(10)}
     
-    # Add top weekly active users
+    # Add top weekly active users - with improved logic
     if weekly_stats:
         weekly_sorted = sorted(weekly_stats.items(), key=lambda x: x[1], reverse=True)
-        top_weekly = {uid for uid, dur in weekly_sorted[:20] 
-                     if uid not in top_co_occurrence and dur > 3600}[:10]
+        # Take top weekly users not already selected, with lower threshold for more users
+        weekly_candidates = [
+            uid for uid, dur in weekly_sorted[:30]  # Expanded from 20
+            if uid not in top_co_occurrence and dur > 1800  # Reduced from 3600 (30 min instead of 1 hour)
+        ]
+        top_weekly = set(weekly_candidates[:10])
     else:
         top_weekly = set()
     
@@ -421,15 +438,19 @@ async def generate_relationship_network_graph(
     # Build graph
     G = nx.Graph()
     
-    # Add nodes
+    # Add nodes with truncated names
     valid_users = []
     for user_id in selected_users:
         if user_id in members_map:
             name = get_preferred_name(members_map[user_id])
+            # Truncate very long names for network graph
+            if len(name) > 10:
+                name = name[:8] + ".."
             G.add_node(user_id, label=name)
             valid_users.append(user_id)
     
     if len(valid_users) < 2:
+        logging.info(f"After filtering, not enough valid users for network graph in guild {guild.id}")
         return None
     
     # Add edges
@@ -497,7 +518,7 @@ async def generate_relationship_network_graph(
         labels = nx.get_node_attributes(G, 'label')
         for node, (x, y) in pos.items():
             ax.annotate(labels[node], (x, y), 
-                       fontsize=10, ha='center', va='center',
+                       fontsize=9, ha='center', va='center',  # Reduced font size for truncated names
                        fontproperties=font_prop, zorder=3)
         
         # Styling

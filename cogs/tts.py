@@ -330,7 +330,8 @@ class TTSCog(commands.Cog):
         temp_path = output_path + '.tmp'
         
         try:
-            tts = gTTS(text=text, lang='zh-CN')
+            # Use 'zh' instead of deprecated 'zh-CN'
+            tts = gTTS(text=text, lang='zh')
             tts.save(temp_path)
             os.replace(temp_path, output_path)  # Atomic operation
             
@@ -414,14 +415,22 @@ class TTSCog(commands.Cog):
             # Create completion event
             done = asyncio.Event()
             
+            # Capture the current event loop for the callback
+            loop = asyncio.get_running_loop()
+            
             def after_playback(error):
                 if error:
                     logging.error(f"Playback error: {error}")
-                asyncio.run_coroutine_threadsafe(done.set(), asyncio.get_event_loop())
+                # Use the captured event loop instead of trying to get it from the audio thread
+                asyncio.run_coroutine_threadsafe(done.set(), loop)
             
             try:
-                # Create audio source and play
-                source = discord.FFmpegPCMAudio(tts_path, executable=FFMPEG_EXECUTABLE)
+                # Create audio source with additional FFmpeg options to reduce warnings
+                ffmpeg_options = {
+                    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+                    'options': '-vn -b:a 128k'
+                }
+                source = discord.FFmpegPCMAudio(tts_path, executable=FFMPEG_EXECUTABLE, **ffmpeg_options)
                 vc.play(source, after=after_playback)
                 
                 # Wait for completion with timeout
