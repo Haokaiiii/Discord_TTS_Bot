@@ -421,13 +421,13 @@ class TTSCog(commands.Cog):
             def after_playback(error):
                 if error:
                     logging.error(f"Playback error: {error}")
-                # Use the captured event loop instead of trying to get it from the audio thread
-                asyncio.run_coroutine_threadsafe(done.set(), loop)
+                # Use call_soon_threadsafe instead of run_coroutine_threadsafe for non-coroutine functions
+                loop.call_soon_threadsafe(done.set)
             
             try:
-                # Create audio source with additional FFmpeg options to reduce warnings
+                # Create audio source with FFmpeg options for local files
                 ffmpeg_options = {
-                    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+                    'before_options': '-nostdin -loglevel error',
                     'options': '-vn -b:a 128k'
                 }
                 source = discord.FFmpegPCMAudio(tts_path, executable=FFMPEG_EXECUTABLE, **ffmpeg_options)
@@ -580,5 +580,7 @@ class TTSCog(commands.Cog):
         else:
             await ctx.send("我当前不在此服务器的任何语音频道中。", delete_after=10)
 
-async def setup(bot: commands.Bot):
-    await bot.add_cog(TTSCog(bot)) 
+# Add at the end of the file
+async def setup(bot):
+    """Setup function required for cog loading."""
+    await bot.add_cog(TTSCog(bot))

@@ -845,6 +845,7 @@ class StatsCog(commands.Cog):
         except Exception as e:
             logging.error(f"[Heatmap Cmd] Unexpected error during heatmap command execution for guild {guild.id}: {e}", exc_info=True)
 
-async def setup(bot: commands.Bot):
-    db_manager = DatabaseManager() # Create instance here
-    await bot.add_cog(StatsCog(bot, db_manager)) 
+# Add at the end of the file
+async def setup(bot):
+    """Setup function required for cog loading."""
+    await bot.add_cog(StatsCog(bot, bot.db_manager))

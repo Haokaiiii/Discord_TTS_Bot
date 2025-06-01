@@ -24,23 +24,20 @@ RUN useradd --system --create-home --uid 1000 botuser
 WORKDIR /app
 
 # Install runtime dependencies and fonts with better CJK support
-# Combine RUN commands and clean up apt cache
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y \
     ffmpeg \
-    libnss3 \
-    libasound2 \
-    fontconfig \
+    fonts-wqy-zenhei \
+    fonts-wqy-microhei \
     fonts-noto-cjk \
     fonts-noto-cjk-extra \
-    fonts-noto-color-emoji \
-    fonts-wqy-microhei \
-    fonts-wqy-zenhei \
-    fonts-arphic-ukai \
-    fonts-arphic-uming \
-    ca-certificates \
+    fontconfig \
+    locales \
+    && locale-gen en_US.UTF-8 \
     && fc-cache -fv \
-    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
 
 # Copy wheels from builder
 COPY --from=builder /app/wheels /wheels
@@ -73,6 +70,7 @@ RUN mkdir -p /app/tts_cache /app/data_backup /app/mplconfig \
 # Set environment variables (MPLCONFIGDIR helps matplotlib find a writable dir)
 ENV MPLCONFIGDIR=/app/mplconfig
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONIOENCODING=UTF-8
 ENV TZ=Australia/Sydney
 # Consider setting PYTHONIOENCODING=UTF-8
 

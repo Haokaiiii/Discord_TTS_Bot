@@ -44,28 +44,105 @@ def setup_fonts():
     """Setup fonts with proper fallback handling."""
     global font_prop
     
-    # Default font list
-    font_list = ['DejaVu Sans', 'Arial Unicode MS', 'sans-serif']
+    # 重建字体缓存 - 使用兼容的方法
+    try:
+        # 尝试新版本的方法
+        if hasattr(fm, 'fontManager'):
+            fm.fontManager.__init__()
+        else:
+            # 回退到旧版本方法
+            fm._rebuild()
+    except Exception as e:
+        logging.debug(f"Font cache rebuild failed: {e}")
     
-    # Try to load Chinese font
-    if os.path.exists(FONT_PATH):
-        try:
-            font_prop = fm.FontProperties(fname=FONT_PATH)
-            font_name = font_prop.get_name()
-            font_list.insert(0, font_name)
-            logging.info(f"Loaded Chinese font: {font_name}")
-        except Exception as e:
-            logging.warning(f"Failed to load font from {FONT_PATH}: {e}")
-            font_prop = None
+    # Chinese font candidates with better paths
+    chinese_fonts = [
+        '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc',
+        '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc', 
+        '/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc',
+        '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+        '/usr/share/fonts/truetype/noto-cjk/NotoSansCJK-Regular.ttc',
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+    ]
     
-    # Configure matplotlib
-    plt.rcParams['font.sans-serif'] = font_list
+    # System font names
+    system_fonts = [
+        'WenQuanYi Zen Hei', 'WenQuanYi Micro Hei', 'Noto Sans CJK SC',
+        'SimHei', 'Microsoft YaHei', 'PingFang SC', 'Hiragino Sans GB'
+    ]
     
-    # Set seaborn style
-    sns.set_theme(style="whitegrid", palette="deep")
+    font_loaded = False
     
-    # Suppress font warnings
+    # Try file-based fonts first
+    for font_path in chinese_fonts:
+        if os.path.exists(font_path):
+            try:
+                font_prop = fm.FontProperties(fname=font_path)
+                font_name = font_prop.get_name()
+                
+                # Configure matplotlib with proper fallback chain
+                plt.rcParams['font.sans-serif'] = [font_name, 'DejaVu Sans', 'Arial Unicode MS', 'Liberation Sans']
+                plt.rcParams['font.family'] = 'sans-serif'
+                
+                # Test with Chinese characters
+                test_fig, test_ax = plt.subplots(figsize=(1, 1))
+                test_ax.text(0.5, 0.5, '测试中文', fontproperties=font_prop)
+                plt.close(test_fig)
+                
+                logging.info(f"Successfully loaded Chinese font: {font_name} from {font_path}")
+                font_loaded = True
+                break
+            except Exception as e:
+                logging.debug(f"Failed to load font {font_path}: {e}")
+                continue
+    
+    # Try system fonts if file-based fonts failed
+    if not font_loaded:
+        for font_name in system_fonts:
+            try:
+                available_fonts = [f.name for f in fm.fontManager.ttflist]
+                if any(font_name.lower() in f.lower() for f in available_fonts):
+                    plt.rcParams['font.sans-serif'] = [font_name, 'DejaVu Sans', 'Arial Unicode MS', 'Liberation Sans']
+                    font_prop = fm.FontProperties(family=font_name)
+                    logging.info(f"Added system font: {font_name}")
+                    font_loaded = True
+                    break
+            except Exception as e:
+                logging.debug(f"Font {font_name} not available: {e}")
+                continue
+    
+    # Enhanced fallback configuration
+    if not font_loaded:
+        logging.warning("No Chinese fonts found, using fallback configuration")
+        plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial Unicode MS', 'Liberation Sans', 'sans-serif']
+        font_prop = fm.FontProperties(family='DejaVu Sans')
+    
+    # Essential matplotlib configuration for Chinese support
+    plt.rcParams.update({
+        'axes.unicode_minus': False,
+        'font.size': 11,
+        'axes.labelsize': 12,
+        'axes.titlesize': 14,
+        'xtick.labelsize': 10,
+        'ytick.labelsize': 10,
+        'legend.fontsize': 10,
+        'figure.titlesize': 16,
+        'font.serif': ['DejaVu Serif', 'Times New Roman', 'serif'],
+        'font.monospace': ['DejaVu Sans Mono', 'Courier New', 'monospace']
+    })
+    
+    # 移除有问题的字体缓存刷新调用
+    # matplotlib.font_manager._rebuild()  # 这行导致错误，已移除
+    
+    # Set seaborn style with better Chinese support
+    sns.set_theme(style="whitegrid", palette="husl", font_scale=1.1)
+    
+    # Suppress font warnings more effectively
     warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
+    warnings.filterwarnings("ignore", message=".*Glyph.*missing from font.*")
+    warnings.filterwarnings("ignore", message=".*findfont.*")
+    
+    logging.info("Font setup completed")
 
 # Initialize fonts
 setup_fonts()
@@ -140,13 +217,13 @@ def validate_and_clean_data(data: pd.DataFrame, name: str) -> Optional[pd.DataFr
 def create_heatmap(
     data: pd.DataFrame, 
     title: str, 
-    color_map: str = "viridis", 
+    color_map: str = "RdYlBu_r", 
     annot: bool = True, 
     fmt: str = ".1f",
     vmin: Optional[float] = None,
     vmax: Optional[float] = None
 ) -> Optional[io.BytesIO]:
-    """Create a heatmap with improved layout and error handling."""
+    """Create a modern, beautiful heatmap with improved styling."""
     # Validate data
     data = validate_and_clean_data(data, title)
     if data is None:
@@ -159,50 +236,99 @@ def create_heatmap(
         data = data.iloc[:MAX_PLOT_SIZE, :MAX_PLOT_SIZE]
         rows, cols = data.shape
     
-    # Calculate figure size
-    base_size = 0.5
+    # Calculate dynamic figure size
+    base_size = 0.6
     figsize = (
-        max(8, min(20, cols * base_size + 2)),
-        max(6, min(20, rows * base_size + 2))
+        max(10, min(24, cols * base_size + 4)),
+        max(8, min(20, rows * base_size + 3))
     )
     
     with plot_context(title) as fig:
+        fig.set_size_inches(figsize)
+        fig.patch.set_facecolor('white')
+        
+        # Create subplot with better spacing
         ax = fig.add_subplot(111)
         
-        # Create heatmap
+        # Modern color palettes
+        modern_cmaps = {
+            "RdYlBu_r": "RdYlBu_r",
+            "viridis": "viridis", 
+            "plasma": "plasma",
+            "inferno": "inferno",
+            "magma": "magma",
+            "cividis": "cividis"
+        }
+        
+        selected_cmap = modern_cmaps.get(color_map, color_map)
+        
+        # Create heatmap with enhanced styling
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             
-            # Determine if we should annotate
-            should_annotate = annot and (rows * cols <= 625)  # Max 25x25
+            should_annotate = annot and (rows * cols <= 400)  # Max 20x20 for annotations
             
-            sns.heatmap(
+            # Create the heatmap
+            im = sns.heatmap(
                 data, 
                 annot=should_annotate, 
                 fmt=fmt, 
-                cmap=color_map,
-                cbar_kws={'label': '值'},
+                cmap=selected_cmap,
+                cbar_kws={
+                    'label': '数值',
+                    'shrink': 0.8,
+                    'aspect': 20,
+                    'pad': 0.02
+                },
                 square=False,
-                linewidths=0.5 if rows <= 30 else 0,
+                linewidths=0.5 if rows <= 25 else 0.1,
+                linecolor='white',
                 ax=ax,
                 vmin=vmin,
-                vmax=vmax
+                vmax=vmax,
+                annot_kws={'size': 8, 'weight': 'bold'} if should_annotate else None
             )
         
-        # Set title and labels
-        ax.set_title(title, fontsize=14, fontproperties=font_prop, pad=20)
+        # Enhanced title styling
+        ax.set_title(
+            title, 
+            fontsize=16, 
+            fontproperties=font_prop, 
+            pad=25,
+            weight='bold',
+            color='#2E3440'
+        )
         
-        # Rotate labels for readability
-        plt.setp(ax.get_xticklabels(), rotation=45, ha='right', fontsize=8)
-        plt.setp(ax.get_yticklabels(), rotation=0, fontsize=8)
+        # Fix colorbar label font
+        cbar = im.collections[0].colorbar
+        if cbar:
+            cbar.set_label('数值', fontproperties=font_prop)
         
-        # Adjust layout
+        # Better label formatting with Chinese font support
+        plt.setp(ax.get_xticklabels(), 
+        rotation=45, 
+        ha='right', 
+        fontsize=9,
+        weight='medium',
+        fontproperties=font_prop)  # Add this line
+        plt.setp(ax.get_yticklabels(), 
+        rotation=0, 
+        fontsize=9,
+        weight='medium',
+        fontproperties=font_prop)  # Add this line
+        
+        # Enhanced grid and spines
+        ax.grid(False)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        
+        # Improved layout
         try:
-            fig.tight_layout(pad=2.0)
+            fig.tight_layout(pad=3.0)
         except:
-            fig.subplots_adjust(left=0.2, right=0.9, top=0.9, bottom=0.2)
+            fig.subplots_adjust(left=0.15, right=0.92, top=0.88, bottom=0.15)
         
-        return save_plot_to_buffer(fig)
+        return save_plot_to_buffer(fig, dpi=200)
 
 async def generate_co_occurrence_heatmap(
     guild: discord.Guild,
@@ -376,6 +502,12 @@ async def generate_periodic_chart(
         ax.set_title(f'{guild.name} - {period_name}语音活动 Top {n_members}',
                     fontsize=14, fontproperties=font_prop, pad=20)
         
+        # Apply font properties to tick labels
+        for label in ax.get_xticklabels():
+            label.set_fontproperties(font_prop)
+        for label in ax.get_yticklabels():
+            label.set_fontproperties(font_prop)
+        
         # Grid
         ax.grid(True, axis='x', alpha=0.3)
         ax.set_axisbelow(True)
@@ -516,14 +648,14 @@ async def generate_relationship_network_graph(
         
         # Draw labels
         labels = nx.get_node_attributes(G, 'label')
+        # Draw node labels with Chinese font support
         for node, (x, y) in pos.items():
-            ax.annotate(labels[node], (x, y), 
-                       fontsize=9, ha='center', va='center',  # Reduced font size for truncated names
-                       fontproperties=font_prop, zorder=3)
+        ax.text(x, y, labels[node], ha='center', va='center',
+        fontsize=8, weight='bold', color='white',
+        fontproperties=font_prop, zorder=3)
         
-        # Styling
-        ax.set_title(f'{guild.name} - 成员关系网络图', 
-                    fontsize=16, fontproperties=font_prop, pad=20)
+        ax.set_title(f'{guild.name} - 成员关系网络图',
+        fontsize=16, fontproperties=font_prop, pad=20)
         ax.axis('off')
         
         # Set axis limits with padding
@@ -535,4 +667,25 @@ async def generate_relationship_network_graph(
         
         fig.tight_layout(pad=1.0)
         
-        return save_plot_to_buffer(fig, dpi=200)  # Higher DPI for network graph 
+        return save_plot_to_buffer(fig, dpi=200)  # Higher DPI for network graph
+
+# Enhanced matplotlib configuration for modern plots
+matplotlib.rcParams.update({
+    'figure.dpi': 120,
+    'savefig.dpi': 200,
+    'figure.facecolor': 'white',
+    'axes.facecolor': 'white',
+    'axes.edgecolor': '#CCCCCC',
+    'axes.linewidth': 0.8,
+    'axes.grid': True,
+    'axes.grid.axis': 'both',
+    'grid.color': '#E5E5E5',
+    'grid.linestyle': '-',
+    'grid.linewidth': 0.5,
+    'grid.alpha': 0.7,
+    'xtick.color': '#666666',
+    'ytick.color': '#666666',
+    'text.color': '#2E3440',
+    'axes.labelcolor': '#2E3440',
+    'axes.titlecolor': '#2E3440'
+})
