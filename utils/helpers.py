@@ -1,9 +1,21 @@
 import logging
+from typing import Optional, Union
 import discord
 from discord.ext import commands
+from functools import lru_cache
 
-def get_preferred_name(member: discord.Member | discord.User) -> str:
-    """Returns the nickname if available, otherwise the global name or username."""
+# Cache for command channel lookups
+_command_channel_cache: dict[int, Optional[discord.TextChannel]] = {}
+
+def get_preferred_name(member: Union[discord.Member, discord.User]) -> str:
+    """Returns the nickname if available, otherwise the global name or username.
+    
+    Args:
+        member: Discord member or user object
+        
+    Returns:
+        The preferred display name for the user
+    """
     if isinstance(member, discord.Member) and member.nick:
         return member.nick
     if hasattr(member, 'global_name') and member.global_name:
@@ -11,93 +23,271 @@ def get_preferred_name(member: discord.Member | discord.User) -> str:
     return member.name
 
 def check_channel():
-    """Decorator to check if the command is used in the allowed channel."""
-    async def predicate(ctx: commands.Context):
+    """Decorator to check if the command is used in the allowed channel.
+    
+    This decorator ensures commands are only executed in designated channels
+    or via DMs if configured.
+    """
+    async def predicate(ctx: commands.Context) -> bool:
         from utils.config import ALLOWED_COMMAND_CHANNEL_ID
-        # Allow DMs or specific channel
+        
+        # Allow DMs
         if isinstance(ctx.channel, discord.DMChannel):
             return True
+            
+        # Allow any channel if not configured
         if ALLOWED_COMMAND_CHANNEL_ID == 0:
-            return True # Allow if no channel is specified
+            return True
+            
+        # Check if in allowed channel
         if ctx.channel.id == ALLOWED_COMMAND_CHANNEL_ID:
             return True
-        await ctx.send(f"命令只能在指定的频道 <#{ALLOWED_COMMAND_CHANNEL_ID}> 或私信中使用。", delete_after=10)
+            
+        # Send error message
+        try:
+            await ctx.send(
+                f"命令只能在指定的频道 <#{ALLOWED_COMMAND_CHANNEL_ID}> 或私信中使用。",
+                delete_after=10
+            )
+        except discord.HTTPException:
+            logging.warning(f"Failed to send channel restriction message in {ctx.channel.id}")
+            
         return False
+        
     return commands.check(predicate)
 
 def has_required_permissions(channel: discord.VoiceChannel) -> bool:
-    """Check if the bot has connect and speak permissions in the voice channel."""
+    """Check if the bot has connect and speak permissions in the voice channel.
+    
+    Args:
+        channel: The voice channel to check
+        
+    Returns:
+        True if bot has required permissions, False otherwise
+    """
+    if not channel.guild.me:
+        logging.error(f"Bot member not found in guild {channel.guild.id}")
+        return False
+        
     permissions = channel.permissions_for(channel.guild.me)
     return permissions.connect and permissions.speak
 
-async def send_to_command_channel(bot: commands.Bot, guild_id: int, content: str = None, file: discord.File = None, embed: discord.Embed = None):
-    """Sends a message, file, or embed to the designated command channel for a guild."""
+@lru_cache(maxsize=128)
+def _get_command_channel(guild: discord.Guild, channel_id: int) -> Optional[discord.TextChannel]:
+    """Get command channel with caching.
+    
+    Args:
+        guild: The guild to search in
+        channel_id: The channel ID to find
+        
+    Returns:
+        The text channel if found and valid, None otherwise
+    """
+    channel = guild.get_channel(channel_id)
+    if channel and isinstance(channel, discord.TextChannel):
+        return channel
+    return None
+
+def _find_fallback_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
+    """Find a fallback text channel the bot can write to.
+    
+    Args:
+        guild: The guild to search in
+        
+    Returns:
+        First available text channel with send permissions, or None
+    """
+    bot_member = guild.me
+    if not bot_member:
+        return None
+        
+    # Prioritize channels based on common patterns
+    priority_patterns = ['general', 'chat', 'bot', 'command']
+    
+    # First, try priority channels
+    for pattern in priority_patterns:
+        for channel in guild.text_channels:
+            if pattern in channel.name.lower() and channel.permissions_for(bot_member).send_messages:
+                return channel
+    
+    # Then, try any channel we can write to
+    for channel in guild.text_channels:
+        if channel.permissions_for(bot_member).send_messages:
+            return channel
+            
+    return None
+
+async def send_to_command_channel(
+    bot: commands.Bot,
+    guild_id: int,
+    content: Optional[str] = None,
+    file: Optional[discord.File] = None,
+    embed: Optional[discord.Embed] = None
+) -> bool:
+    """Sends a message, file, or embed to the designated command channel for a guild.
+    
+    Args:
+        bot: The bot instance
+        guild_id: The guild ID to send to
+        content: Optional text content
+        file: Optional file to send
+        embed: Optional embed to send
+        
+    Returns:
+        True if message was sent successfully, False otherwise
+    """
     from utils.config import ALLOWED_COMMAND_CHANNEL_ID
+
+    # Validate inputs
+    if not any([content, file, embed]):
+        logging.warning("send_to_command_channel called with no content")
+        return False
 
     guild = bot.get_guild(guild_id)
     if not guild:
         logging.warning(f"Could not find guild {guild_id}. Cannot send message.")
-        return
+        return False
 
-    channel = None
-    if ALLOWED_COMMAND_CHANNEL_ID != 0:
-        channel = guild.get_channel(ALLOWED_COMMAND_CHANNEL_ID)
-        
+    # Try to get cached channel first
+    channel = _command_channel_cache.get(guild_id)
+    
+    # If not cached or invalid, find channel
     if not channel or not isinstance(channel, discord.TextChannel):
+        channel = None
+        
         if ALLOWED_COMMAND_CHANNEL_ID != 0:
-            logging.warning(f"Designated command channel {ALLOWED_COMMAND_CHANNEL_ID} not found or invalid in guild {guild_id}. Looking for fallback channel.")
+            channel = _get_command_channel(guild, ALLOWED_COMMAND_CHANNEL_ID)
+            
+            if not channel:
+                logging.warning(
+                    f"Designated command channel {ALLOWED_COMMAND_CHANNEL_ID} not found "
+                    f"or invalid in guild {guild_id}. Looking for fallback channel."
+                )
         else:
             logging.info(f"No command channel configured for guild {guild_id}. Looking for fallback channel.")
+        
+        # Find fallback if needed
+        if not channel:
+            channel = _find_fallback_channel(guild)
             
-        # Try to find the first available text channel the bot can write to
-        fallback_channel = None
-        for ch in guild.text_channels:
-            if ch.permissions_for(guild.me).send_messages:
-                fallback_channel = ch
-                break
-        if fallback_channel:
-             logging.info(f"Using fallback channel {fallback_channel.name} ({fallback_channel.id}) in guild {guild_id}.")
-             channel = fallback_channel
-        else:
-             logging.error(f"No suitable fallback channel found in guild {guild_id}. Cannot send message.")
-             return
+            if channel:
+                logging.info(f"Using fallback channel {channel.name} ({channel.id}) in guild {guild_id}.")
+            else:
+                logging.error(f"No suitable channel found in guild {guild_id}. Cannot send message.")
+                return False
+        
+        # Cache the channel
+        _command_channel_cache[guild_id] = channel
 
+    # Send the message
     try:
         await channel.send(content=content, file=file, embed=embed)
         logging.info(f"Sent message to channel {channel.name} ({channel.id}) in guild {guild_id}")
+        return True
+        
     except discord.Forbidden:
         logging.error(f"Missing permissions to send messages in channel {channel.name} ({channel.id}) in guild {guild_id}.")
+        # Clear cache entry as channel might have changed permissions
+        _command_channel_cache.pop(guild_id, None)
+        
     except discord.HTTPException as e:
         logging.error(f"Failed to send message to channel {channel.name} ({channel.id}) in guild {guild_id}: {e}")
+        
+    except Exception as e:
+        logging.error(f"Unexpected error sending message to guild {guild_id}: {e}", exc_info=True)
+        
+    return False
+
+def clear_channel_cache(guild_id: Optional[int] = None):
+    """Clear the command channel cache.
+    
+    Args:
+        guild_id: If provided, only clear cache for this guild. Otherwise clear all.
+    """
+    if guild_id:
+        _command_channel_cache.pop(guild_id, None)
+        _get_command_channel.cache_clear()  # Clear LRU cache as well
+    else:
+        _command_channel_cache.clear()
+        _get_command_channel.cache_clear()
 
 class BotException(Exception):
     """Custom exception class for bot-specific errors."""
     pass
 
-async def handle_command_error(ctx: commands.Context, error):
-    """Global error handler for commands."""
+async def handle_command_error(ctx: commands.Context, error: Exception):
+    """Global error handler for commands with improved error messages.
+    
+    Args:
+        ctx: The command context
+        error: The exception that was raised
+    """
+    # Log the error first
+    if ctx.command:
+        logging.error(f"Error in command '{ctx.command.name}' by {ctx.author}: {error}", exc_info=error)
+    
+    # Handle specific error types
     if isinstance(error, commands.CommandNotFound):
-        # await ctx.send("未知命令。", delete_after=10)
-        return # Ignore unknown commands silently
+        # Silently ignore unknown commands
+        return
+        
     elif isinstance(error, commands.CheckFailure):
-        # Handled by the check_channel decorator usually
-        logging.warning(f"Check failed for command '{ctx.command}' by {ctx.author}: {error}")
-        pass # Message is sent by the check itself
+        # Already handled by check decorators usually
+        logging.debug(f"Check failed for command '{ctx.command}' by {ctx.author}: {error}")
+        return
+        
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"缺少必要的参数: {error.param.name}", delete_after=10)
+        await safe_send(ctx, f"缺少必要的参数: {error.param.name}", delete_after=10)
+        
     elif isinstance(error, commands.BadArgument):
-        await ctx.send("参数类型错误或无效。", delete_after=10)
+        await safe_send(ctx, f"参数错误: {str(error)}", delete_after=10)
+        
+    elif isinstance(error, commands.CommandOnCooldown):
+        await safe_send(ctx, f"命令冷却中，请 {error.retry_after:.1f} 秒后再试。", delete_after=10)
+        
     elif isinstance(error, BotException):
-        await ctx.send(f"发生错误: {error}", delete_after=10)
+        await safe_send(ctx, f"发生错误: {error}", delete_after=15)
+        
     elif isinstance(error, commands.CommandInvokeError):
         original = error.original
+        
         if isinstance(original, discord.Forbidden):
-            await ctx.send("机器人缺少执行此操作所需的权限。")
+            await safe_send(ctx, "机器人缺少执行此操作所需的权限。")
+            
         elif isinstance(original, discord.HTTPException):
-            await ctx.send(f"网络错误: {original.status} {original.text}")
+            if original.status == 429:  # Rate limited
+                await safe_send(ctx, "请求过于频繁，请稍后再试。")
+            else:
+                await safe_send(ctx, f"网络错误: {original.status} {original.text[:100]}")
+                
         else:
-            logging.error(f"Command '{ctx.command}' raised an exception: {original}", exc_info=original)
-            await ctx.send("执行命令时发生内部错误。")
+            await safe_send(ctx, "执行命令时发生内部错误，已记录详情。")
+            
     else:
-        logging.error(f"Unhandled error in command '{ctx.command}': {error}", exc_info=error)
-        await ctx.send("发生未知错误。") 
+        await safe_send(ctx, "发生未知错误，已记录详情。")
+
+async def safe_send(
+    ctx: commands.Context,
+    content: str,
+    delete_after: Optional[float] = None,
+    **kwargs
+) -> Optional[discord.Message]:
+    """Safely send a message with error handling.
+    
+    Args:
+        ctx: The command context
+        content: The message content
+        delete_after: Optional seconds after which to delete the message
+        **kwargs: Additional arguments to pass to send()
+        
+    Returns:
+        The sent message if successful, None otherwise
+    """
+    try:
+        return await ctx.send(content, delete_after=delete_after, **kwargs)
+    except discord.HTTPException as e:
+        logging.warning(f"Failed to send message in {ctx.channel}: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"Unexpected error sending message: {e}", exc_info=True)
+        return None 

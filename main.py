@@ -1,147 +1,223 @@
-import discord
-from discord.ext import commands
 import logging
 import asyncio
-import os
+import signal
 import sys
-import signal # For handling signals
+from typing import Optional
+import discord
+from discord.ext import commands
 
-# Initializers and Setup
 from utils.logging_config import setup_logging
-setup_logging() # Setup logging first
-
 from utils.config import DISCORD_TOKEN, COMMAND_PREFIX
-from utils.database import DatabaseManager # Import to ensure connection logic is available if needed early
-from utils.health import start_health_server # Import health check
-import backoff # For retry logic
-import aiohttp # For health check server and potential bot connection errors
+from utils.health import start_health_server
+from utils.database import DatabaseManager
+from utils.helpers import clear_channel_cache
 
-# Define Intents
+# Setup logging first
+setup_logging()
+
+# Configure intents
 intents = discord.Intents.default()
+intents.message_content = True
 intents.voice_states = True
+intents.members = True
 intents.guilds = True
-intents.messages = True
-intents.members = True # Required for on_member_update, on_voice_state_update, member lookups
-intents.message_content = True # Required for commands
+intents.presences = False  # Not needed, save bandwidth
 
-# Define Bot
-# Consider using AutoShardedBot if you expect to scale beyond 2000 guilds
-bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
-bot.health_runner = None # Placeholder for health server runner
-bot.report_scheduler = None # Placeholder for APScheduler instance from StatsCog
-
-# List of Cogs to load
-INITIAL_EXTENSIONS = [
-    'cogs.events',
-    'cogs.tts',
-    'cogs.stats',
-    # Add other cogs like 'cogs.admin' here if created
-]
-
-async def load_extensions():
-    """Loads the initial cogs for the bot."""
-    for extension in INITIAL_EXTENSIONS:
+class DiscordTTSBot(commands.Bot):
+    """Main bot class with improved error handling and lifecycle management."""
+    
+    def __init__(self):
+        super().__init__(
+            command_prefix=commands.when_mentioned_or(COMMAND_PREFIX),
+            intents=intents,
+            help_command=None,  # We'll implement a custom help command
+            case_insensitive=True,
+            strip_after_prefix=True,
+            activity=discord.Game(name="语音统计与TTS"),
+            status=discord.Status.online
+        )
+        self.db_manager: Optional[DatabaseManager] = None
+        self.health_runner = None
+        self._shutdown_event = asyncio.Event()
+        self._extensions_loaded = False
+        
+    async def setup_hook(self):
+        """Initialize bot components during setup."""
+        logging.info("Bot setup hook started")
+        
+        # Initialize database
         try:
-            await bot.load_extension(extension)
-            logging.info(f"Successfully loaded extension: {extension}")
-        except commands.ExtensionNotFound:
-            logging.error(f"Extension not found: {extension}")
-        except commands.ExtensionAlreadyLoaded:
-            logging.warning(f"Extension already loaded: {extension}")
-        except commands.NoEntryPointError:
-            logging.error(f"Extension {extension} has no setup function.")
-        except commands.ExtensionFailed as e:
-            logging.error(f"Extension {extension} failed to load: {e.__cause__}", exc_info=True)
+            self.db_manager = DatabaseManager()
+            logging.info("Database manager initialized")
         except Exception as e:
-            logging.error(f"An unexpected error occurred while loading extension {extension}: {e}", exc_info=True)
-
-@backoff.on_exception(
-    backoff.expo, 
-    (aiohttp.ClientConnectorError, discord.errors.ConnectionClosed, asyncio.TimeoutError),
-    max_tries=10, # Increase max retries
-    max_time=600, # Increase max time
-    on_backoff=lambda details: logging.warning(f"Connection error, backing off {details['wait']:.1f}s after {details['tries']} tries..."),
-    on_giveup=lambda details: logging.critical("Bot connection failed after multiple retries. Giving up.")
-)
-async def run_bot():
-    """Starts the bot, handling potential connection issues with backoff."""
-    async with bot: # Use async context manager for proper cleanup
-        await load_extensions() 
-        await start_health_server(bot) # Start health check server
-        logging.info("Starting bot...")
-        await bot.start(DISCORD_TOKEN)
-
-async def shutdown(signal, loop):
-    """Graceful shutdown procedure."""
-    logging.info(f"Received exit signal {signal.name}...")
-    logging.info("Shutting down tasks and extensions...")
-
-    # Cancel background tasks (adjust based on actual tasks used)
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    [task.cancel() for task in tasks]
-    logging.info(f"Cancelling {len(tasks)} outstanding tasks...")
-    await asyncio.gather(*tasks, return_exceptions=True)
-    logging.info("Tasks cancelled.")
-
-    # Stop scheduler if running
-    if bot.report_scheduler and bot.report_scheduler.running:
-        logging.info("Shutting down report scheduler...")
+            logging.critical(f"Failed to initialize database: {e}")
+            raise
+        
+        # Load extensions
+        await self.load_extensions()
+        
+        # Start health check server
         try:
-             bot.report_scheduler.shutdown(wait=False)
-             logging.info("Scheduler shut down.")
+            await start_health_server(self)
+            logging.info("Health check server started")
         except Exception as e:
-             logging.error(f"Error shutting down scheduler: {e}")
+            logging.error(f"Failed to start health check server: {e}")
+            # Non-critical, continue
+        
+        logging.info("Bot setup completed")
+    
+    async def load_extensions(self):
+        """Load all cog extensions with error handling."""
+        extensions = [
+            'cogs.events',
+            'cogs.stats', 
+            'cogs.tts'
+        ]
+        
+        for extension in extensions:
+            try:
+                await self.load_extension(extension)
+                logging.info(f"Loaded extension: {extension}")
+            except Exception as e:
+                logging.error(f"Failed to load extension {extension}: {e}", exc_info=True)
+                # Continue loading other extensions
+        
+        self._extensions_loaded = True
+        
+    async def on_ready(self):
+        """Called when the bot is fully ready."""
+        logging.info(f"Bot ready: {self.user} (ID: {self.user.id})")
+        logging.info(f"Connected to {len(self.guilds)} guilds")
+        
+    async def on_guild_join(self, guild: discord.Guild):
+        """Handle bot joining a new guild."""
+        logging.info(f"Joined guild: {guild.name} (ID: {guild.id})")
+        clear_channel_cache(guild.id)  # Clear any cached channel data
+        
+    async def on_guild_remove(self, guild: discord.Guild):
+        """Handle bot removal from a guild."""
+        logging.info(f"Removed from guild: {guild.name} (ID: {guild.id})")
+        clear_channel_cache(guild.id)
+        
+    async def on_error(self, event: str, *args, **kwargs):
+        """Handle errors in event handlers."""
+        logging.error(f"Error in event {event}", exc_info=True)
+        
+    async def close(self):
+        """Gracefully shutdown the bot."""
+        logging.info("Bot shutdown initiated")
+        
+        # Signal shutdown to prevent new operations
+        self._shutdown_event.set()
+        
+        # Close health check server
+        if hasattr(self, 'health_runner') and self.health_runner:
+            try:
+                await self.health_runner.cleanup()
+                logging.info("Health check server stopped")
+            except Exception as e:
+                logging.error(f"Error stopping health server: {e}")
+        
+        # Save any pending data
+        if self.db_manager:
+            try:
+                # Get stats cog and save data
+                stats_cog = self.get_cog('StatsCog')
+                if stats_cog:
+                    logging.info("Saving final statistics...")
+                    await stats_cog.save_stats()
+                    
+                    # Cancel scheduled tasks
+                    if hasattr(stats_cog, 'save_stats') and stats_cog.save_stats.is_running():
+                        stats_cog.save_stats.cancel()
+                    
+                    if hasattr(stats_cog, 'scheduler'):
+                        stats_cog.scheduler.cancel()
+                        
+            except Exception as e:
+                logging.error(f"Error saving final stats: {e}")
+        
+        # Disconnect voice clients
+        try:
+            tts_cog = self.get_cog('TTSCog')
+            if tts_cog:
+                logging.info("Disconnecting voice clients...")
+                # The cog_unload method will handle cleanup
+        except Exception as e:
+            logging.error(f"Error during TTS cleanup: {e}")
+        
+        # Unload extensions
+        if self._extensions_loaded:
+            for extension in list(self.extensions):
+                try:
+                    await self.unload_extension(extension)
+                    logging.info(f"Unloaded extension: {extension}")
+                except Exception as e:
+                    logging.error(f"Error unloading {extension}: {e}")
+        
+        # Close database connections
+        if self.db_manager:
+            try:
+                self.db_manager.close()
+                await self.db_manager.aclose()
+                logging.info("Database connections closed")
+            except Exception as e:
+                logging.error(f"Error closing database: {e}")
+        
+        # Clear caches
+        clear_channel_cache()
+        
+        # Call parent close
+        await super().close()
+        logging.info("Bot shutdown complete")
 
-    # Close the bot connection
-    if bot.is_ready():
-        logging.info("Closing bot connection...")
-        await bot.close()
-        logging.info("Bot connection closed.")
+async def main():
+    """Main entry point with proper lifecycle management."""
+    bot = DiscordTTSBot()
+    
+    # Setup signal handlers for graceful shutdown
+    def signal_handler(sig, frame):
+        logging.info(f"Received signal {sig}")
+        asyncio.create_task(bot.close())
+    
+    # Register signal handlers
+    if sys.platform != "win32":
+        # Unix-like systems
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, signal_handler)
     else:
-         logging.warning("Bot was not ready, skipping close().")
-
-    # Shutdown health check server
-    if bot.health_runner:
-        logging.info("Shutting down health check server...")
-        await bot.health_runner.cleanup()
-        logging.info("Health check server shut down.")
-
-    # Close MongoDB connection (assuming DatabaseManager holds the client)
-    # This requires accessing the client instance, maybe pass db_manager to main?
-    # Or have DatabaseManager provide a class method for cleanup?
-    # For simplicity, assuming MongoClient handles its own cleanup to some extent.
-    logging.info("Database client cleanup implicitly handled by MongoClient driver.")
-
-    loop.stop()
-    logging.info("Shutdown complete.")
-
+        # Windows - only SIGINT is reliable
+        signal.signal(signal.SIGINT, signal_handler)
+    
+    try:
+        # Start the bot
+        async with bot:
+            await bot.start(DISCORD_TOKEN)
+            
+    except discord.LoginFailure:
+        logging.critical("Invalid Discord token")
+        return 1
+        
+    except discord.PrivilegedIntentsRequired:
+        logging.critical("Bot requires privileged intents that are not enabled")
+        return 1
+        
+    except Exception as e:
+        logging.critical(f"Fatal error: {e}", exc_info=True)
+        return 1
+        
+    return 0
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-
-    # Register signal handlers for graceful shutdown
-    signals = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
-    for s in signals:
-        try:
-            loop.add_signal_handler(
-                s, lambda s=s: asyncio.create_task(shutdown(s, loop))
-            )
-            logging.info(f"Registered signal handler for {s.name}")
-        except NotImplementedError:
-             logging.warning(f"Signal handler for {s.name} not implemented on this platform.")
-             # Windows might not support all signals
-
     try:
-        loop.run_until_complete(run_bot())
+        # Run the bot
+        exit_code = asyncio.run(main())
+        sys.exit(exit_code)
+        
     except KeyboardInterrupt:
-         logging.info("KeyboardInterrupt received, initiating shutdown...")
-         # This might trigger the SIGINT handler anyway, but good to have
-         loop.run_until_complete(shutdown(signal.SIGINT, loop))
+        logging.info("Received keyboard interrupt")
+        sys.exit(0)
+        
     except Exception as e:
-         logging.critical(f"Critical error during bot execution: {e}", exc_info=True)
-         # Attempt graceful shutdown even on unexpected top-level error
-         loop.run_until_complete(shutdown(signal.SIGTERM, loop))
-    finally:
-        if not loop.is_closed():
-            logging.info("Closing event loop.")
-            loop.close() 
+        logging.critical(f"Unhandled exception: {e}", exc_info=True)
+        sys.exit(1) 

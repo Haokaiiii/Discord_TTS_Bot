@@ -3,82 +3,195 @@ import json
 import os
 import glob
 from datetime import datetime
+from typing import Dict, Tuple, Any, Optional, List
 from pymongo import MongoClient
+from pymongo.errors import PyMongoError
 import backoff
 from asyncio import Lock
+from motor.motor_asyncio import AsyncIOMotorClient
 
-from utils.config import MONGODB_URI, BACKUP_DIR
+from utils.config import MONGODB_URI, BACKUP_DIR, MAX_BACKUP_FILES
 
 class DatabaseManager:
     def __init__(self):
-        self.client = MongoClient(MONGODB_URI)
-        self.db = self.client['discord_bot']
-        self.voice_stats_col = self.db['voice_stats']
-        self.co_occurrence_col = self.db['co_occurrence_stats']
-        self.save_lock = Lock()
-        logging.info("DatabaseManager initialized and connected to MongoDB.")
-
-    def _save_local_backup(self, data, filename):
-        """Saves data to a local backup file."""
-        backup_path = os.path.join(BACKUP_DIR, filename)
+        """Initialize database manager with connection pooling and async support."""
         try:
-            with open(backup_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=4)
-            logging.info(f"Local backup created: {backup_path}")
-        except IOError as e:
-            logging.error(f"Failed to create local backup {backup_path}: {e}")
+            # Sync client for initial loading
+            self.sync_client = MongoClient(
+                MONGODB_URI, 
+                serverSelectionTimeoutMS=5000,
+                connectTimeoutMS=10000,
+                maxPoolSize=50
+            )
+            # Test connection
+            self.sync_client.admin.command('ping')
+            
+            # Async client for runtime operations
+            self.async_client = AsyncIOMotorClient(
+                MONGODB_URI,
+                serverSelectionTimeoutMS=5000,
+                connectTimeoutMS=10000,
+                maxPoolSize=50
+            )
+            
+            self.db_name = 'discord_bot'
+            self.sync_db = self.sync_client[self.db_name]
+            self.async_db = self.async_client[self.db_name]
+            
+            # Collection names
+            self.voice_stats_collection = 'voice_stats'
+            self.co_occurrence_collection = 'co_occurrence_stats'
+            
+            # Async lock for save operations
+            self.save_lock = Lock()
+            
+            logging.info("DatabaseManager initialized with connection pooling.")
+            
+        except PyMongoError as e:
+            logging.error(f"Failed to connect to MongoDB: {e}")
+            raise
 
-    def _load_local_backup(self, filename):
+    def _rotate_backups(self, pattern: str) -> None:
+        """Rotate backup files to maintain MAX_BACKUP_FILES limit."""
+        backup_files = sorted(glob.glob(os.path.join(BACKUP_DIR, pattern)))
+        
+        if len(backup_files) > MAX_BACKUP_FILES:
+            files_to_remove = backup_files[:-MAX_BACKUP_FILES]
+            for file_path in files_to_remove:
+                try:
+                    os.remove(file_path)
+                    logging.info(f"Removed old backup: {file_path}")
+                except OSError as e:
+                    logging.error(f"Failed to remove old backup {file_path}: {e}")
+
+    def _save_local_backup(self, data: Dict[Any, Any], filename: str) -> bool:
+        """Saves data to a local backup file with rotation."""
+        backup_path = os.path.join(BACKUP_DIR, filename)
+        
+        try:
+            # Write to temp file first
+            temp_path = backup_path + '.tmp'
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            
+            # Atomic rename
+            os.replace(temp_path, backup_path)
+            logging.info(f"Local backup created: {backup_path}")
+            
+            # Rotate old backups
+            base_name = filename.split('_')[0]
+            self._rotate_backups(f"{base_name}_*.json")
+            
+            return True
+            
+        except (IOError, OSError) as e:
+            logging.error(f"Failed to create local backup {backup_path}: {e}")
+            # Clean up temp file if it exists
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                pass
+            return False
+
+    def _load_local_backup(self, filename: str) -> Optional[Dict[Any, Any]]:
         """Loads data from a local backup file."""
         backup_path = os.path.join(BACKUP_DIR, filename)
-        if os.path.exists(backup_path):
-            try:
-                with open(backup_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except (IOError, json.JSONDecodeError) as e:
-                logging.error(f"Failed to load local backup {backup_path}: {e}")
+        
+        if not os.path.exists(backup_path):
+            return None
+            
+        try:
+            with open(backup_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            logging.info(f"Loaded data from backup: {backup_path}")
+            return data
+        except (IOError, json.JSONDecodeError) as e:
+            logging.error(f"Failed to load local backup {backup_path}: {e}")
+            return None
+
+    def _find_latest_backup(self, prefix: str) -> Optional[str]:
+        """Find the most recent backup file with given prefix."""
+        pattern = os.path.join(BACKUP_DIR, f"{prefix}_*.json")
+        backup_files = sorted(glob.glob(pattern))
+        
+        if backup_files:
+            return os.path.basename(backup_files[-1])
         return None
 
-    @backoff.on_exception(backoff.expo, Exception, max_tries=5, max_time=300)
-    async def save_voice_stats(self, voice_stats_data: dict):
+    @backoff.on_exception(
+        backoff.expo,
+        PyMongoError,
+        max_tries=5,
+        max_time=300,
+        on_backoff=lambda details: logging.warning(f"MongoDB retry attempt {details['tries']} after {details['wait']:.1f}s")
+    )
+    async def save_voice_stats(self, voice_stats_data: Dict[int, Dict[int, Dict[str, float]]]) -> bool:
+        """Save voice statistics with retry logic and backup."""
         async with self.save_lock:
-            logging.debug("Acquired lock for saving voice stats.")
             try:
-                # Prepare data for backup (convert keys to strings)
+                # Create backup
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 backup_data = {
                     str(guild_id): {
-                        str(member_id): data
-                        for member_id, data in members.items()
+                        str(member_id): stats
+                        for member_id, stats in members.items()
                     }
                     for guild_id, members in voice_stats_data.items()
                 }
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                self._save_local_backup(backup_data, f"voice_stats_{timestamp}.json")
-
+                
+                backup_success = self._save_local_backup(
+                    backup_data, 
+                    f"voice_stats_{timestamp}.json"
+                )
+                
+                if not backup_success:
+                    logging.warning("Failed to create backup before saving to MongoDB")
+                
                 # Save to MongoDB
+                collection = self.async_db[self.voice_stats_collection]
+                
+                # Use bulk operations for efficiency
+                operations = []
                 for guild_id, members in voice_stats_data.items():
                     serialized_members = {
-                        str(member_id): data
-                        for member_id, data in members.items()
+                        str(member_id): stats
+                        for member_id, stats in members.items()
                     }
-                    self.voice_stats_col.update_one(
-                        {'guild_id': guild_id},
-                        {'$set': {'members': serialized_members}},
-                        upsert=True
-                    )
-                logging.info("Voice stats saved to MongoDB.")
-            except Exception as e:
-                logging.error(f"Error saving voice stats: {e}", exc_info=True)
+                    operations.append({
+                        'filter': {'guild_id': guild_id},
+                        'update': {'$set': {'members': serialized_members, 'updated_at': datetime.utcnow()}},
+                        'upsert': True
+                    })
+                
+                if operations:
+                    result = await collection.bulk_write([
+                        {'updateOne': op} for op in operations
+                    ])
+                    logging.info(f"Voice stats saved to MongoDB: {result.modified_count} modified, {result.upserted_count} upserted")
+                
+                return True
+                
+            except PyMongoError as e:
+                logging.error(f"MongoDB error saving voice stats: {e}")
                 raise
-            finally:
-                logging.debug("Released lock for saving voice stats.")
+            except Exception as e:
+                logging.error(f"Unexpected error saving voice stats: {e}", exc_info=True)
+                return False
 
-    @backoff.on_exception(backoff.expo, Exception, max_tries=5, max_time=300)
-    async def save_co_occurrence_stats(self, co_occurrence_data: dict):
+    @backoff.on_exception(
+        backoff.expo,
+        PyMongoError,
+        max_tries=5,
+        max_time=300,
+        on_backoff=lambda details: logging.warning(f"MongoDB retry attempt {details['tries']} after {details['wait']:.1f}s")
+    )
+    async def save_co_occurrence_stats(self, co_occurrence_data: Dict[int, Dict[Tuple[int, int], float]]) -> bool:
+        """Save co-occurrence statistics with retry logic and backup."""
         async with self.save_lock:
-            logging.debug("Acquired lock for saving co-occurrence stats.")
             try:
-                # Prepare data for backup
+                # Create backup
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 backup_data = {
                     str(guild_id): {
                         f"{m1},{m2}": duration
@@ -86,177 +199,196 @@ class DatabaseManager:
                     }
                     for guild_id, pairs in co_occurrence_data.items()
                 }
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                self._save_local_backup(backup_data, f"co_occurrence_{timestamp}.json")
-
+                
+                backup_success = self._save_local_backup(
+                    backup_data,
+                    f"co_occurrence_{timestamp}.json"
+                )
+                
+                if not backup_success:
+                    logging.warning("Failed to create backup before saving to MongoDB")
+                
                 # Save to MongoDB
+                collection = self.async_db[self.co_occurrence_collection]
+                
+                # Use bulk operations
+                operations = []
                 for guild_id, pairs in co_occurrence_data.items():
                     serialized_pairs = {
                         f"{m1},{m2}": duration
                         for (m1, m2), duration in pairs.items()
                     }
-                    self.co_occurrence_col.update_one(
-                        {'guild_id': guild_id},
-                        {'$set': {'pairs': serialized_pairs}},
-                        upsert=True
-                    )
-                logging.info("Co-occurrence stats saved to MongoDB.")
-            except Exception as e:
-                logging.error(f"Error saving co-occurrence stats: {e}", exc_info=True)
+                    operations.append({
+                        'filter': {'guild_id': guild_id},
+                        'update': {'$set': {'pairs': serialized_pairs, 'updated_at': datetime.utcnow()}},
+                        'upsert': True
+                    })
+                
+                if operations:
+                    result = await collection.bulk_write([
+                        {'updateOne': op} for op in operations
+                    ])
+                    logging.info(f"Co-occurrence stats saved to MongoDB: {result.modified_count} modified, {result.upserted_count} upserted")
+                
+                return True
+                
+            except PyMongoError as e:
+                logging.error(f"MongoDB error saving co-occurrence stats: {e}")
                 raise
-            finally:
-                logging.debug("Released lock for saving co-occurrence stats.")
+            except Exception as e:
+                logging.error(f"Unexpected error saving co-occurrence stats: {e}", exc_info=True)
+                return False
 
-    def load_voice_stats(self) -> dict:
-        voice_stats = {}
+    def load_voice_stats(self) -> Dict[int, Dict[int, Dict[str, float]]]:
+        """Load voice statistics from backup or MongoDB."""
+        voice_stats: Dict[int, Dict[int, Dict[str, float]]] = {}
+        
         try:
-            # Try loading from the latest local backup first
-            backup_files = sorted(glob.glob(os.path.join(BACKUP_DIR, "voice_stats_*.json")))
-            if backup_files:
-                latest_backup_path = backup_files[-1]
-                backup_data = self._load_local_backup(os.path.basename(latest_backup_path))
+            # Try loading from latest backup first
+            latest_backup = self._find_latest_backup("voice_stats")
+            if latest_backup:
+                backup_data = self._load_local_backup(latest_backup)
                 if backup_data:
+                    # Convert string keys back to integers
                     for guild_id_str, members in backup_data.items():
                         try:
                             guild_id = int(guild_id_str)
-                            voice_stats[guild_id] = {
-                                int(member_id): data
-                                for member_id, data in members.items()
-                            }
+                            voice_stats[guild_id] = {}
+                            
+                            for member_id_str, stats in members.items():
+                                try:
+                                    member_id = int(member_id_str)
+                                    voice_stats[guild_id][member_id] = stats
+                                except ValueError:
+                                    logging.warning(f"Invalid member ID '{member_id_str}' in backup")
+                                    
                         except ValueError:
-                            logging.warning(f"Skipping invalid guild ID '{guild_id_str}' in backup file {latest_backup_path}")
-                    logging.info(f"Loaded voice stats from local backup: {latest_backup_path}")
-                    return voice_stats
-                else:
-                    logging.warning(f"Failed to load data from latest backup {latest_backup_path}. Attempting MongoDB.")
-            else:
-                 logging.info("No local voice stats backups found. Attempting MongoDB.")
-
-            # If backup loading failed or no backups exist, load from MongoDB
-            for doc in self.voice_stats_col.find():
+                            logging.warning(f"Invalid guild ID '{guild_id_str}' in backup")
+                    
+                    if voice_stats:
+                        logging.info(f"Loaded voice stats from backup: {latest_backup}")
+                        return voice_stats
+            
+            # Fall back to MongoDB
+            collection = self.sync_db[self.voice_stats_collection]
+            for doc in collection.find():
                 guild_id = doc['guild_id']
                 members = doc.get('members', {})
-                voice_stats[guild_id] = {
-                    int(member_id): data
-                    for member_id, data in members.items()
-                }
-            logging.info("Loaded voice stats from MongoDB.")
+                
+                voice_stats[guild_id] = {}
+                for member_id_str, stats in members.items():
+                    try:
+                        member_id = int(member_id_str)
+                        voice_stats[guild_id][member_id] = stats
+                    except ValueError:
+                        logging.warning(f"Invalid member ID '{member_id_str}' in MongoDB")
+            
+            logging.info(f"Loaded voice stats from MongoDB: {len(voice_stats)} guilds")
+            
         except Exception as e:
             logging.error(f"Error loading voice stats: {e}", exc_info=True)
+        
         return voice_stats
 
-    def load_co_occurrence_stats(self) -> dict:
-        co_occurrence_stats = {}
+    def load_co_occurrence_stats(self) -> Dict[int, Dict[Tuple[int, int], float]]:
+        """Load co-occurrence statistics from backup or MongoDB."""
+        co_occurrence_stats: Dict[int, Dict[Tuple[int, int], float]] = {}
+        
         try:
-            # Try loading from the latest local backup first
-            backup_files = sorted(glob.glob(os.path.join(BACKUP_DIR, "co_occurrence_*.json")))
-            if backup_files:
-                latest_backup_path = backup_files[-1]
-                logging.info(f"Attempting to load co-occurrence stats from local backup: {latest_backup_path}")
-                backup_data = self._load_local_backup(os.path.basename(latest_backup_path))
+            # Try loading from latest backup first
+            latest_backup = self._find_latest_backup("co_occurrence")
+            if latest_backup:
+                backup_data = self._load_local_backup(latest_backup)
                 if backup_data:
-                    loaded_from_backup = False
-                    for guild_id_str, pairs_str_dict in backup_data.items():
-                        try:
-                            guild_id = int(guild_id_str)
-                            guild_data = {}
-                            if not isinstance(pairs_str_dict, dict):
-                                logging.warning(f"Expected a dictionary for pairs in guild {guild_id_str}, got {type(pairs_str_dict)}. Skipping guild in backup.")
-                                continue
-                            
-                            for pair_key_str, duration in pairs_str_dict.items():
-                                try:
-                                    # Ensure the key is a string and contains a comma
-                                    if not isinstance(pair_key_str, str) or ',' not in pair_key_str:
-                                        logging.warning(f"Skipping invalid non-string or malformed pair key '{pair_key_str}' (type: {type(pair_key_str)}) in backup for guild {guild_id_str}.")
-                                        continue
-                                    
-                                    m1_str, m2_str = pair_key_str.split(',')
-                                    m1 = int(m1_str)
-                                    m2 = int(m2_str)
-                                    duration_float = float(duration) # Ensure duration is float
-                                    # Create the tuple key with integers, sorted
-                                    tuple_key = tuple(sorted((m1, m2)))
-                                    guild_data[tuple_key] = duration_float
-                                    # logging.debug(f"Loaded pair {tuple_key} -> {duration_float} for guild {guild_id}")
-                                except (ValueError, TypeError) as e:
-                                    logging.warning(f"Skipping invalid pair key components or duration '{pair_key_str}' -> '{duration}' in backup for guild {guild_id_str}. Error: {e}")
-                                except Exception as e:
-                                    logging.error(f"Unexpected error processing pair key '{pair_key_str}' in backup for guild {guild_id_str}: {e}", exc_info=True)
-                                
-                            if guild_data: # Only add if we successfully loaded pairs
-                                co_occurrence_stats[guild_id] = guild_data
-                                loaded_from_backup = True
-                                
-                        except ValueError:
-                            logging.warning(f"Skipping invalid guild ID '{guild_id_str}' in backup file {latest_backup_path}")
-                        except Exception as e:
-                            logging.error(f"Unexpected error processing guild data for '{guild_id_str}' in backup {latest_backup_path}: {e}", exc_info=True)
-                           
+                    loaded_from_backup = self._parse_co_occurrence_data(backup_data, co_occurrence_stats, "backup")
                     if loaded_from_backup:
-                        logging.info(f"Successfully loaded co-occurrence stats from local backup: {latest_backup_path}")
+                        logging.info(f"Loaded co-occurrence stats from backup: {latest_backup}")
                         return co_occurrence_stats
-                    else:
-                        logging.warning(f"Loaded backup file {latest_backup_path}, but no valid data found. Attempting MongoDB.")
-                else:
-                    logging.warning(f"Failed to load data from latest backup {latest_backup_path}. Attempting MongoDB.")
-            else:
-                logging.info("No local co-occurrence stats backups found. Attempting MongoDB.")
-
-            # If backup loading failed or no backups/valid data exist, load from MongoDB
-            logging.info("Loading co-occurrence stats from MongoDB.")
-            mongo_data_loaded = False
-            for doc in self.co_occurrence_col.find():
-                try:
-                    guild_id = doc['guild_id']
-                    pairs = doc.get('pairs', {})
-                    guild_data = {}
-                    if not isinstance(pairs, dict):
-                        logging.warning(f"Expected a dictionary for pairs in MongoDB for guild {guild_id}, got {type(pairs)}. Skipping.")
-                        continue
-                    
-                    for pair_str, duration in pairs.items():
-                        try:
-                            if not isinstance(pair_str, str) or ',' not in pair_str:
-                                logging.warning(f"Skipping invalid non-string or malformed pair key '{pair_str}' from MongoDB for guild {guild_id}")
-                                continue
-                            
-                            m1_str, m2_str = pair_str.split(',')
-                            m1 = int(m1_str)
-                            m2 = int(m2_str)
-                            duration_float = float(duration)
-                            # Ensure consistent key order (smaller ID first)
-                            tuple_key = tuple(sorted((m1, m2)))
-                            guild_data[tuple_key] = duration_float
-                        except (ValueError, TypeError) as e:
-                            logging.warning(f"Skipping invalid pair key components or duration '{pair_str}' -> '{duration}' in MongoDB for guild {guild_id}. Error: {e}")
-                        except Exception as e:
-                            logging.error(f"Unexpected error processing pair key '{pair_str}' from MongoDB for guild {guild_id}: {e}", exc_info=True)
-                            
-                    if guild_data:
-                        co_occurrence_stats[guild_id] = guild_data
-                        mongo_data_loaded = True
-                        
-                except Exception as e:
-                    logging.error(f"Error processing MongoDB document {doc.get('_id', '?')} for co-occurrence stats: {e}", exc_info=True)
-                    
-            if mongo_data_loaded:
-                logging.info("Finished loading co-occurrence stats from MongoDB.")
-            else:
-                logging.info("No co-occurrence data found in MongoDB.")
-                
-        except Exception as e:
-            logging.error(f"General error loading co-occurrence stats: {e}", exc_info=True)
             
-        # Ensure the final structure is sound, even if empty
-        final_stats = {}
-        for gid, pairs_dict in co_occurrence_stats.items():
-            if isinstance(gid, int) and isinstance(pairs_dict, dict):
-                final_stats[gid] = {k: v for k, v in pairs_dict.items() if isinstance(k, tuple) and len(k) == 2 and isinstance(k[0], int) and isinstance(k[1], int) and isinstance(v, float)}
-            else:
-                logging.warning(f"Filtering out invalid guild data during final check: Guild={gid} (type: {type(gid)}) Data Type: {type(pairs_dict)}")
+            # Fall back to MongoDB
+            collection = self.sync_db[self.co_occurrence_collection]
+            mongo_data = {}
+            
+            for doc in collection.find():
+                guild_id = doc['guild_id']
+                pairs = doc.get('pairs', {})
+                mongo_data[str(guild_id)] = pairs
+            
+            if mongo_data:
+                self._parse_co_occurrence_data(mongo_data, co_occurrence_stats, "MongoDB")
+                logging.info(f"Loaded co-occurrence stats from MongoDB: {len(co_occurrence_stats)} guilds")
+            
+        except Exception as e:
+            logging.error(f"Error loading co-occurrence stats: {e}", exc_info=True)
+        
+        return co_occurrence_stats
+
+    def _parse_co_occurrence_data(
+        self, 
+        data: Dict[str, Dict[str, float]], 
+        output: Dict[int, Dict[Tuple[int, int], float]],
+        source: str
+    ) -> bool:
+        """Parse co-occurrence data from backup or MongoDB format."""
+        success = False
+        
+        for guild_id_str, pairs_dict in data.items():
+            try:
+                guild_id = int(guild_id_str)
+                guild_data: Dict[Tuple[int, int], float] = {}
                 
-        return final_stats
+                if not isinstance(pairs_dict, dict):
+                    logging.warning(f"Invalid pairs data for guild {guild_id_str} from {source}")
+                    continue
+                
+                for pair_key, duration in pairs_dict.items():
+                    try:
+                        if not isinstance(pair_key, str) or ',' not in pair_key:
+                            logging.warning(f"Invalid pair key '{pair_key}' from {source}")
+                            continue
+                        
+                        parts = pair_key.split(',')
+                        if len(parts) != 2:
+                            logging.warning(f"Invalid pair key format '{pair_key}' from {source}")
+                            continue
+                        
+                        m1, m2 = int(parts[0]), int(parts[1])
+                        duration_float = float(duration)
+                        
+                        if duration_float > 0:
+                            # Ensure consistent ordering
+                            pair_tuple = tuple(sorted((m1, m2)))
+                            guild_data[pair_tuple] = duration_float
+                            
+                    except (ValueError, TypeError) as e:
+                        logging.warning(f"Error parsing pair '{pair_key}' from {source}: {e}")
+                
+                if guild_data:
+                    output[guild_id] = guild_data
+                    success = True
+                    
+            except ValueError:
+                logging.warning(f"Invalid guild ID '{guild_id_str}' from {source}")
+            except Exception as e:
+                logging.error(f"Error processing guild {guild_id_str} from {source}: {e}")
+        
+        return success
+
+    def close(self):
+        """Close database connections."""
+        try:
+            self.sync_client.close()
+            logging.info("Closed sync MongoDB connection")
+        except Exception as e:
+            logging.error(f"Error closing sync MongoDB connection: {e}")
+
+    async def aclose(self):
+        """Close async database connections."""
+        try:
+            self.async_client.close()
+            logging.info("Closed async MongoDB connection")
+        except Exception as e:
+            logging.error(f"Error closing async MongoDB connection: {e}")
 
 # Optional: Provide a global instance if preferred, though dependency injection is generally better.
 # db_manager = DatabaseManager() 

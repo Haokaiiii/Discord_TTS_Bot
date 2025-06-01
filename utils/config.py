@@ -1,87 +1,120 @@
 import os
 import logging
+from typing import Set, Optional
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Bot Token
-DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-if not DISCORD_TOKEN:
-    logging.error("Missing DISCORD_TOKEN environment variable.")
-    exit(1)
+def get_env_str(key: str, default: Optional[str] = None, required: bool = True) -> Optional[str]:
+    """Get string environment variable with validation."""
+    value = os.getenv(key, default)
+    if required and not value:
+        logging.error(f"Missing required environment variable: {key}")
+        exit(1)
+    return value
 
-# MongoDB URI
-MONGODB_URI = os.getenv('MONGODB_URI')
-if not MONGODB_URI:
-    logging.error("Missing MONGODB_URI environment variable.")
-    exit(1)
+def get_env_int(key: str, default: int = 0, min_val: Optional[int] = None, max_val: Optional[int] = None) -> int:
+    """Get integer environment variable with validation."""
+    str_val = os.getenv(key, str(default))
+    try:
+        int_val = int(str_val)
+        if min_val is not None and int_val < min_val:
+            logging.warning(f"{key}={int_val} is below minimum {min_val}. Using minimum.")
+            return min_val
+        if max_val is not None and int_val > max_val:
+            logging.warning(f"{key}={int_val} is above maximum {max_val}. Using maximum.")
+            return max_val
+        return int_val
+    except ValueError:
+        logging.error(f"Invalid integer value '{str_val}' for {key}. Using default {default}.")
+        return default
+
+def get_env_float(key: str, default: float = 0.0, min_val: Optional[float] = None) -> float:
+    """Get float environment variable with validation."""
+    str_val = os.getenv(key, str(default))
+    try:
+        float_val = float(str_val)
+        if min_val is not None and float_val < min_val:
+            logging.warning(f"{key}={float_val} is below minimum {min_val}. Using minimum.")
+            return min_val
+        return float_val
+    except ValueError:
+        logging.error(f"Invalid float value '{str_val}' for {key}. Using default {default}.")
+        return default
+
+def get_env_set_int(key: str, default: str = '') -> Set[int]:
+    """Get a set of integers from comma-separated environment variable."""
+    str_val = os.getenv(key, default)
+    result = set()
+    
+    if not str_val.strip():
+        return result
+        
+    for item in str_val.split(','):
+        item = item.strip()
+        if item.isdigit():
+            result.add(int(item))
+        elif item:
+            logging.warning(f"Invalid non-numeric value '{item}' in {key}. Ignoring.")
+    
+    return result
+
+# Bot Token - Required
+DISCORD_TOKEN = get_env_str('DISCORD_TOKEN', required=True)
+
+# MongoDB URI - Required
+MONGODB_URI = get_env_str('MONGODB_URI', required=True)
 
 # Bot Settings
-COMMAND_PREFIX = os.getenv('COMMAND_PREFIX', '!')
+COMMAND_PREFIX = get_env_str('COMMAND_PREFIX', default='!', required=False)
 
-# --- ALLOWED_COMMAND_CHANNEL_ID ---
-allowed_channel_id_str = os.getenv('ALLOWED_COMMAND_CHANNEL_ID', '0')
-try:
-    ALLOWED_COMMAND_CHANNEL_ID = int(allowed_channel_id_str)
-except ValueError:
-    logging.error(f"Invalid value '{allowed_channel_id_str}' for ALLOWED_COMMAND_CHANNEL_ID. Must be an integer. Using default 0.")
-    ALLOWED_COMMAND_CHANNEL_ID = 0
+# Allowed Command Channel ID (0 means any channel)
+ALLOWED_COMMAND_CHANNEL_ID = get_env_int('ALLOWED_COMMAND_CHANNEL_ID', default=0, min_val=0)
 
-# --- EXCLUDED_VOICE_CHANNEL_IDS ---
-excluded_ids_str = os.getenv('EXCLUDED_VOICE_CHANNEL_IDS', '')
-excluded_ids_list = excluded_ids_str.split(',')
-EXCLUDED_VOICE_CHANNEL_IDS = set()
-for item in excluded_ids_list:
-    item = item.strip() # Remove leading/trailing whitespace
-    if item.isdigit(): # Check if it's actually a number
-        EXCLUDED_VOICE_CHANNEL_IDS.add(int(item))
-    elif item: # Log if it's not empty but also not a digit
-        logging.warning(f"Invalid non-numeric value '{item}' found in EXCLUDED_VOICE_CHANNEL_IDS environment variable. Ignoring.")
-# The old check `if '' in EXCLUDED_VOICE_CHANNEL_IDS:` is no longer needed.
+# Excluded Voice Channel IDs
+EXCLUDED_VOICE_CHANNEL_IDS = get_env_set_int('EXCLUDED_VOICE_CHANNEL_IDS')
 
 # TTS Settings
-TTS_CACHE_DIR = os.getenv('TTS_CACHE_DIR', 'tts_cache')
-FFMPEG_EXECUTABLE = os.getenv('FFMPEG_EXECUTABLE', 'ffmpeg')
+TTS_CACHE_DIR = get_env_str('TTS_CACHE_DIR', default='tts_cache', required=False)
+FFMPEG_EXECUTABLE = get_env_str('FFMPEG_EXECUTABLE', default='ffmpeg', required=False)
 
-# --- DEBOUNCE_TIME ---
-debounce_time_str = os.getenv('DEBOUNCE_TIME', '2.0')
-try:
-    DEBOUNCE_TIME = float(debounce_time_str)
-except ValueError:
-    logging.error(f"Invalid value '{debounce_time_str}' for DEBOUNCE_TIME. Must be a float. Using default 2.0.")
-    DEBOUNCE_TIME = 2.0
-
+# Debounce Time (minimum 0.1 seconds)
+DEBOUNCE_TIME = get_env_float('DEBOUNCE_TIME', default=2.0, min_val=0.1)
 
 # Backup Settings
-BACKUP_DIR = os.getenv('BACKUP_DIR', 'data_backup')
+BACKUP_DIR = get_env_str('BACKUP_DIR', default='data_backup', required=False)
+MAX_BACKUP_FILES = get_env_int('MAX_BACKUP_FILES', default=10, min_val=1, max_val=100)
 
 # Health Check Server
-# --- HEALTH_CHECK_PORT ---
-health_port_str = os.getenv('HEALTH_CHECK_PORT', '8080')
-try:
-    HEALTH_CHECK_PORT = int(health_port_str)
-except ValueError:
-    logging.error(f"Invalid value '{health_port_str}' for HEALTH_CHECK_PORT. Must be an integer. Using default 8080.")
-    HEALTH_CHECK_PORT = 8080
+HEALTH_CHECK_PORT = get_env_int('HEALTH_CHECK_PORT', default=8080, min_val=1024, max_val=65535)
+HEALTH_CHECK_HOST = get_env_str('HEALTH_CHECK_HOST', default='0.0.0.0', required=False)
 
-HEALTH_CHECK_HOST = os.getenv('HEALTH_CHECK_HOST', '0.0.0.0')
+# Font Configuration
+FONT_PATH = get_env_str('FONT_PATH', default='/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc', required=False)
 
-# Paths (Consider making these configurable if needed)
-FONT_PATH = '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc' # Specific to Docker image
+# Performance Settings
+MAX_PLOT_SIZE = get_env_int('MAX_PLOT_SIZE', default=40, min_val=10, max_val=100)
+TTS_QUEUE_SIZE = get_env_int('TTS_QUEUE_SIZE', default=10, min_val=5, max_val=50)
+TTS_TIMEOUT = get_env_float('TTS_TIMEOUT', default=45.0, min_val=10.0)
 
 # Create necessary directories
-os.makedirs(TTS_CACHE_DIR, exist_ok=True)
-os.makedirs(BACKUP_DIR, exist_ok=True)
+for directory in [TTS_CACHE_DIR, BACKUP_DIR]:
+    try:
+        os.makedirs(directory, exist_ok=True)
+        logging.info(f"Ensured directory exists: {directory}")
+    except OSError as e:
+        logging.error(f"Failed to create directory {directory}: {e}")
+        exit(1)
 
-# Log loaded config
-logging.info("Configuration loaded.")
+# Log loaded configuration
+logging.info("Configuration loaded successfully.")
 logging.info(f"Command Prefix: {COMMAND_PREFIX}")
-logging.info(f"Allowed Command Channel ID: {ALLOWED_COMMAND_CHANNEL_ID if ALLOWED_COMMAND_CHANNEL_ID != 0 else 'None'}")
+logging.info(f"Allowed Command Channel ID: {ALLOWED_COMMAND_CHANNEL_ID if ALLOWED_COMMAND_CHANNEL_ID != 0 else 'Any channel'}")
 logging.info(f"Excluded Voice Channel IDs: {EXCLUDED_VOICE_CHANNEL_IDS if EXCLUDED_VOICE_CHANNEL_IDS else 'None'}")
 logging.info(f"TTS Cache Directory: {TTS_CACHE_DIR}")
-logging.info(f"Debounce Time: {DEBOUNCE_TIME}")
-logging.info(f"Backup Directory: {BACKUP_DIR}")
-logging.info(f"Health Check Port: {HEALTH_CHECK_PORT}")
-logging.info(f"FFmpeg Executable: {FFMPEG_EXECUTABLE}")
-logging.info(f"Font Path: {FONT_PATH}") 
+logging.info(f"Debounce Time: {DEBOUNCE_TIME}s")
+logging.info(f"Backup Directory: {BACKUP_DIR} (Max Files: {MAX_BACKUP_FILES})")
+logging.info(f"Health Check: {HEALTH_CHECK_HOST}:{HEALTH_CHECK_PORT}")
+logging.info(f"Font Path: {FONT_PATH}")
+logging.info(f"Performance: Max Plot Size={MAX_PLOT_SIZE}, TTS Queue={TTS_QUEUE_SIZE}, TTS Timeout={TTS_TIMEOUT}s") 
