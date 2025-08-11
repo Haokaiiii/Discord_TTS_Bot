@@ -158,6 +158,9 @@ HEALTH_CHECK_HOST = get_env_str('HEALTH_CHECK_HOST', default='0.0.0.0', required
 
 # Font Configuration
 FONT_PATH = get_env_str('FONT_PATH', default='/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc', required=False)
+if FONT_PATH and not os.path.exists(FONT_PATH):
+    logging.warning(f"Configured FONT_PATH does not exist: {FONT_PATH}. Falling back to defaults.")
+    # Keep value for reference but plotting will fall back internally
 
 # Performance Settings
 MAX_PLOT_SIZE = get_env_int('MAX_PLOT_SIZE', default=40, min_val=10, max_val=100)

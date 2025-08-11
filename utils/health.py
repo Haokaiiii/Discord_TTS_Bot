@@ -7,6 +7,7 @@ import logging
 from aiohttp import web
 
 from utils.config import HEALTH_CHECK_HOST, HEALTH_CHECK_PORT
+from utils.database import DatabaseManager
 
 async def health_check(request):
     """Simple health check endpoint.
@@ -25,6 +26,34 @@ async def health_check(request):
     logging.debug("Health check endpoint accessed.")
     return web.Response(text="OK")
 
+
+async def readiness_check(request):
+    """Readiness probe endpoint.
+
+    Attempts a lightweight check against core dependencies (e.g., MongoDB)
+    to determine if the bot is ready to serve traffic.
+
+    Parameters
+    ----------
+    request : aiohttp.web.Request
+        Incoming HTTP request.
+
+    Returns
+    -------
+    aiohttp.web.Response
+        200 OK if ready, 503 Service Unavailable otherwise.
+    """
+    ok = True
+    try:
+        # Minimal DB ping using sync client for simplicity
+        dbm = DatabaseManager()
+        dbm.sync_client.admin.command('ping')
+    except Exception:
+        ok = False
+
+    status = 200 if ok else 503
+    return web.Response(text="READY" if ok else "NOT_READY", status=status)
+
 async def start_health_server(bot):
     """Start the aiohttp web server for health checks.
 
@@ -38,7 +67,10 @@ async def start_health_server(bot):
     None
     """
     app = web.Application()
-    app.add_routes([web.get('/health', health_check)])
+    app.add_routes([
+        web.get('/health', health_check),
+        web.get('/ready', readiness_check),
+    ])
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, HEALTH_CHECK_HOST, HEALTH_CHECK_PORT)

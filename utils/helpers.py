@@ -5,12 +5,44 @@ error handling. All public APIs are documented with NumPy-style docstrings.
 """
 import logging
 from typing import Optional, Union
+import time
 import discord
 from discord.ext import commands
 from functools import lru_cache
 
 # Cache for command channel lookups
 _command_channel_cache: dict[int, Optional[discord.TextChannel]] = {}
+_command_channel_cache_ts: dict[int, float] = {}
+_COMMAND_CHANNEL_TTL_SECONDS = 600.0  # 10 minutes
+
+# Simple per-guild rate limiter for sends (token bucket)
+_SEND_RATE_LIMIT_TOKENS_PER_SEC = 1.0
+_SEND_RATE_LIMIT_BURST = 3.0
+_guild_tokens: dict[int, float] = {}
+_guild_last_refill: dict[int, float] = {}
+
+
+def _rate_limited(guild_id: int) -> bool:
+    now = time.monotonic()
+    capacity = _SEND_RATE_LIMIT_BURST
+    rate = _SEND_RATE_LIMIT_TOKENS_PER_SEC
+
+    last = _guild_last_refill.get(guild_id, now)
+    tokens = _guild_tokens.get(guild_id, capacity)
+
+    # Refill
+    tokens = min(capacity, tokens + (now - last) * rate)
+
+    if tokens >= 1.0:
+        tokens -= 1.0
+        _guild_tokens[guild_id] = tokens
+        _guild_last_refill[guild_id] = now
+        return False  # not limited
+
+    # Store updated state even when limited
+    _guild_tokens[guild_id] = tokens
+    _guild_last_refill[guild_id] = now
+    return True
 
 def get_preferred_name(member: Union[discord.Member, discord.User]) -> str:
     """Return a member's preferred display name.
@@ -175,13 +207,23 @@ async def send_to_command_channel(
         logging.warning("send_to_command_channel called with no content")
         return False
 
+    # Rate limit per guild
+    if _rate_limited(guild_id):
+        logging.warning(f"Rate limited send_to_command_channel for guild {guild_id}")
+        return False
+
     guild = bot.get_guild(guild_id)
     if not guild:
         logging.warning(f"Could not find guild {guild_id}. Cannot send message.")
         return False
 
-    # Try to get cached channel first
+    # Try to get cached channel first (with TTL)
     channel = _command_channel_cache.get(guild_id)
+    ts = _command_channel_cache_ts.get(guild_id, 0.0)
+    if channel and (time.monotonic() - ts) > _COMMAND_CHANNEL_TTL_SECONDS:
+        # Expired
+        channel = None
+        _command_channel_cache.pop(guild_id, None)
     
     # If not cached or invalid, find channel
     if not channel or not isinstance(channel, discord.TextChannel):
@@ -208,8 +250,9 @@ async def send_to_command_channel(
                 logging.error(f"No suitable channel found in guild {guild_id}. Cannot send message.")
                 return False
         
-        # Cache the channel
+        # Cache the channel with timestamp
         _command_channel_cache[guild_id] = channel
+        _command_channel_cache_ts[guild_id] = time.monotonic()
 
     # Send the message
     try:
@@ -221,6 +264,7 @@ async def send_to_command_channel(
         logging.error(f"Missing permissions to send messages in channel {channel.name} ({channel.id}) in guild {guild_id}.")
         # Clear cache entry as channel might have changed permissions
         _command_channel_cache.pop(guild_id, None)
+        _command_channel_cache_ts.pop(guild_id, None)
         
     except discord.HTTPException as e:
         logging.error(f"Failed to send message to channel {channel.name} ({channel.id}) in guild {guild_id}: {e}")
@@ -240,9 +284,11 @@ def clear_channel_cache(guild_id: Optional[int] = None):
     """
     if guild_id:
         _command_channel_cache.pop(guild_id, None)
+        _command_channel_cache_ts.pop(guild_id, None)
         _get_command_channel.cache_clear()  # Clear LRU cache as well
     else:
         _command_channel_cache.clear()
+        _command_channel_cache_ts.clear()
         _get_command_channel.cache_clear()
 
 class BotException(Exception):

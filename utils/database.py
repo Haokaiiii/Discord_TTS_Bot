@@ -16,6 +16,8 @@ from asyncio import Lock
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from utils.config import MONGODB_URI, BACKUP_DIR, MAX_BACKUP_FILES
+from pymongo import ASCENDING
+import gzip
 
 class DatabaseManager:
     """Manage MongoDB connections, retries, and local backups.
@@ -64,6 +66,13 @@ class DatabaseManager:
             self.save_lock = Lock()
             
             logging.info("DatabaseManager initialized with connection pooling.")
+
+            # Ensure indexes for faster lookups
+            try:
+                self.sync_db[self.voice_stats_collection].create_index([('guild_id', ASCENDING)], name='guild_id_idx')
+                self.sync_db[self.co_occurrence_collection].create_index([('guild_id', ASCENDING)], name='guild_id_idx')
+            except Exception as e:
+                logging.warning(f"Failed to ensure indexes: {e}")
             
         except PyMongoError as e:
             logging.error(f"Failed to connect to MongoDB: {e}")
@@ -108,12 +117,22 @@ class DatabaseManager:
         try:
             # Write to temp file first
             temp_path = backup_path + '.tmp'
+            # Write compact JSON to temp file
             with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+                json.dump(data, f, ensure_ascii=False, separators=(',', ':'))
             
             # Atomic rename
             os.replace(temp_path, backup_path)
             logging.info(f"Local backup created: {backup_path}")
+
+            # Also write gzip copy to save space
+            try:
+                gz_path = backup_path + '.gz'
+                with gzip.open(gz_path, 'wt', encoding='utf-8') as gz:
+                    json.dump(data, gz, ensure_ascii=False, separators=(',', ':'))
+                logging.info(f"Gzipped backup written: {gz_path}")
+            except Exception as e:
+                logging.warning(f"Failed to write gz backup {backup_path}.gz: {e}")
             
             # Rotate old backups
             base_name = filename.split('_')[0]

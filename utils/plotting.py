@@ -495,6 +495,11 @@ def create_heatmap(
         
         # Create subplot with better spacing
         ax = fig.add_subplot(111)
+        # Auto-rasterize heavy artists (below zorder 0)
+        try:
+            ax.set_rasterization_zorder(0)
+        except Exception:
+            pass
         
         # Modern color palettes
         modern_cmaps = {
@@ -535,6 +540,12 @@ def create_heatmap(
                 vmax=vmax,
                 annot_kws={'size': annot_fontsize, 'weight': 'bold'} if should_annotate else None
             )
+
+        # Push heatmap below rasterization threshold
+        try:
+            im.set_zorder(-1)
+        except Exception:
+            pass
 
         # Rasterize large heatmaps to speed up rendering and reduce size
         total_cells = rows * cols
@@ -659,23 +670,40 @@ async def generate_co_occurrence_heatmap(
         logging.info(f"Not enough members with data in guild {guild.id}")
         return None
     
-    # Build matrix
+    # Build matrix (vectorized)
     n = len(active_members)
-    matrix = np.zeros((n, n))
-    
-    for i, m1_id in enumerate(active_members):
-        for j, m2_id in enumerate(active_members):
-            if i != j:
-                pair = tuple(sorted((m1_id, m2_id)))
-                duration_seconds = valid_pairs.get(pair, 0)
-                
-                if relative and m1_id in member_period_voice_stats:
-                    total_time = member_period_voice_stats[m1_id]
-                    if total_time > 0:
-                        matrix[i, j] = (duration_seconds / total_time) * 100
-                else:
-                    # For absolute heatmaps, make matrix symmetric
-                    matrix[i, j] = duration_seconds / 3600  # Convert to hours
+    matrix = np.zeros((n, n), dtype=float)
+
+    index_map = {mid: idx for idx, mid in enumerate(active_members)}
+
+    i_idx: List[int] = []
+    j_idx: List[int] = []
+    durations: List[float] = []
+
+    for (a_id, b_id), duration_seconds in valid_pairs.items():
+        if a_id in index_map and b_id in index_map:
+            ai = index_map[a_id]
+            bi = index_map[b_id]
+            # Fill both directions to mirror the nested loop behavior
+            i_idx.extend([ai, bi])
+            j_idx.extend([bi, ai])
+            durations.extend([duration_seconds, duration_seconds])
+
+    if i_idx:
+        i_idx_arr = np.asarray(i_idx, dtype=int)
+        j_idx_arr = np.asarray(j_idx, dtype=int)
+        dur_arr = np.asarray(durations, dtype=float)
+
+        if relative:
+            totals = np.asarray([float(member_period_voice_stats.get(mid, 0.0)) for mid in active_members])
+            denom = totals[i_idx_arr]
+            with np.errstate(divide='ignore', invalid='ignore'):
+                values = np.where(denom > 0.0, (dur_arr / denom) * 100.0, 0.0)
+            matrix[i_idx_arr, j_idx_arr] = values
+        else:
+            # absolute hours
+            values = dur_arr / 3600.0
+            matrix[i_idx_arr, j_idx_arr] = values
     
     # Create DataFrame with smart name truncation
     member_names = []
@@ -880,7 +908,11 @@ def calculate_node_importance(G, weekly_stats=None):
     
     # Calculate centrality measures
     try:
-        betweenness = nx.betweenness_centrality(G)
+        # Use approximation for better performance on larger graphs
+        try:
+            betweenness = nx.approximation.betweenness_centrality(G, k=min(25, max(5, G.number_of_nodes() // 2)), seed=42)
+        except Exception:
+            betweenness = nx.betweenness_centrality(G)
         degree = dict(G.degree())
         
         for node in G.nodes():
@@ -1310,6 +1342,12 @@ async def generate_relationship_network_graph(
         # Step 4: Apply node separation logic (using existing function)
         pos = apply_node_separation(pos, min_distance=0.2)
 
+        # Auto-rasterize heavy artists
+        try:
+            ax.set_rasterization_zorder(0)
+        except Exception:
+            pass
+
         # Draw edges efficiently using a LineCollection with per-edge styles
         edge_weights_normalized = [
             (w - min_duration) / (max_duration - min_duration) if max_duration > min_duration else 0.5
@@ -1329,7 +1367,7 @@ async def generate_relationship_network_graph(
             linewidths.append(1.0 + weight * 4.0)
 
         if segments:
-            lc = LineCollection(segments, colors=colors, linewidths=linewidths, zorder=1)
+            lc = LineCollection(segments, colors=colors, linewidths=linewidths, zorder=-1)
             ax.add_collection(lc)
 
         # Prepare enhanced node visual attributes
