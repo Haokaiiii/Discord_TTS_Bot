@@ -1,3 +1,16 @@
+"""Plot generation utilities for the Discord TTS bot.
+
+This module centralizes all visualization logic used across the project.
+It focuses on memory-safe, backend-agnostic figure generation and includes
+performance optimizations for large plots.
+
+Notes
+-----
+- The non-interactive Matplotlib backend is enforced via ``Agg`` to work in
+  headless environments (e.g., Docker, CI, bot runtime).
+- Functions return in-memory PNG buffers (``io.BytesIO``) suitable for direct
+  upload without writing to disk.
+"""
 import logging
 import os
 import io
@@ -26,6 +39,7 @@ matplotlib.rcParams.update({
 
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
+from matplotlib.collections import LineCollection
 import seaborn as sns
 import numpy as np
 import pandas as pd
@@ -40,8 +54,43 @@ from utils.helpers import get_preferred_name
 # Global font property
 font_prop = None
 
+# Public API of this module
+__all__ = [
+    'setup_fonts',
+    'plot_context',
+    'save_plot_to_buffer',
+    'validate_and_clean_data',
+    'calculate_optimal_font_size',
+    'smart_text_truncation',
+    'auto_adjust_figure_size',
+    'adjust_text_properties',
+    'create_heatmap',
+    'generate_co_occurrence_heatmap',
+    'generate_periodic_chart',
+    'filter_edges_by_strength',
+    'calculate_node_importance',
+    'detect_communities',
+    'create_community_colors',
+    'apply_hierarchical_layout',
+    'create_edge_bundling',
+    'add_interactive_elements_info',
+    'apply_node_separation',
+    'generate_relationship_network_graph',
+    'create_enhanced_community_colors',
+]
+
 def setup_fonts():
-    """Setup fonts with proper fallback handling."""
+    """Initialize font configuration with Chinese-support fallbacks.
+
+    Sets up Matplotlib and Seaborn to handle multilingual text gracefully.
+    Attempts to load common Chinese fonts from file paths and system font
+    names. Falls back to unicode-capable defaults if none are found.
+
+    Returns
+    -------
+    None
+        Fonts and Matplotlib/Seaborn global settings are configured in-place.
+    """
     global font_prop
     
     # 重建字体缓存 - 使用兼容的方法
@@ -149,7 +198,18 @@ setup_fonts()
 
 @contextmanager
 def plot_context(title: str):
-    """Context manager for plot creation with automatic cleanup."""
+    """Context manager for safe plot creation and cleanup.
+
+    Parameters
+    ----------
+    title : str
+        Logical title of the plot. Only used for logging.
+
+    Yields
+    ------
+    matplotlib.figure.Figure
+        The created figure instance for plotting.
+    """
     fig = None
     try:
         logging.debug(f"Creating plot: {title}")
@@ -164,37 +224,76 @@ def plot_context(title: str):
             del fig
         gc.collect()
 
-def save_plot_to_buffer(fig: plt.Figure, dpi: int = 150) -> Optional[io.BytesIO]:
-    """Save a matplotlib figure to a BytesIO buffer with error handling."""
+def save_plot_to_buffer(
+    fig: plt.Figure,
+    dpi: int = 150,
+    use_tight_layout: bool = True,
+) -> Optional[io.BytesIO]:
+    """Serialize a figure to an in-memory PNG buffer.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+        Figure to serialize.
+    dpi : int, default 150
+        Resolution for the saved image.
+    use_tight_layout : bool, default True
+        If True, save with ``bbox_inches='tight'`` to minimize excess margins.
+        Can be disabled for large/complex figures to improve speed.
+
+    Returns
+    -------
+    io.BytesIO or None
+        PNG image buffer on success; None if saving failed.
+    """
     buf = io.BytesIO()
-    
-    try:
-        # Try with bbox_inches='tight' first
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            fig.savefig(buf, format='png', dpi=dpi, bbox_inches='tight', 
-                       facecolor='white', edgecolor='none')
-        buf.seek(0)
-        return buf
-        
-    except Exception as e:
-        logging.warning(f"Failed to save with bbox_inches='tight': {e}")
-        
-        # Try without bbox_inches
-        buf = io.BytesIO()
+
+    def _save(with_tight: bool) -> bool:
         try:
             with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                fig.savefig(buf, format='png', dpi=dpi, 
-                           facecolor='white', edgecolor='none')
-            buf.seek(0)
-            return buf
-        except Exception as e2:
-            logging.error(f"Failed to save plot: {e2}")
-            return None
+                warnings.simplefilter('ignore')
+                fig.savefig(
+                    buf,
+                    format='png',
+                    dpi=dpi,
+                    bbox_inches='tight' if with_tight else None,
+                    facecolor='white',
+                    edgecolor='none',
+                )
+            return True
+        except Exception as exc:  # noqa: BLE001 - log and fallback
+            logging.warning(
+                "Failed to save figure with%s tight bbox: %s",
+                '' if with_tight else 'out',
+                exc,
+            )
+            return False
+
+    ok = _save(use_tight_layout)
+    if not ok:
+        buf = io.BytesIO()  # reset buffer before retry
+        ok = _save(False)
+
+    if ok:
+        buf.seek(0)
+        return buf
+    return None
 
 def validate_and_clean_data(data: pd.DataFrame, name: str) -> Optional[pd.DataFrame]:
-    """Validate and clean a pandas DataFrame."""
+    """Validate and sanitize a DataFrame used for plotting.
+
+    Parameters
+    ----------
+    data : pandas.DataFrame
+        Input data expected for the visualization.
+    name : str
+        Logical dataset name for logging context.
+
+    Returns
+    -------
+    pandas.DataFrame or None
+        Cleaned DataFrame if valid and non-empty, otherwise None.
+    """
     if not isinstance(data, pd.DataFrame):
         logging.error(f"Invalid data type for {name}: {type(data)}")
         return None
@@ -217,7 +316,22 @@ def validate_and_clean_data(data: pd.DataFrame, name: str) -> Optional[pd.DataFr
 # Add these helper functions after the existing helper functions (around line 200)
 
 def calculate_optimal_font_size(text_length: int, available_space: float, base_size: int = 10) -> int:
-    """Calculate optimal font size based on text length and available space."""
+    """Heuristically choose a readable font size.
+
+    Parameters
+    ----------
+    text_length : int
+        Number of characters that must fit.
+    available_space : float
+        Approximate available width/height for the text.
+    base_size : int, default 10
+        Baseline font size used for short text.
+
+    Returns
+    -------
+    int
+        Suggested font size in points.
+    """
     if text_length <= 8:
         return base_size
     elif text_length <= 15:
@@ -228,7 +342,22 @@ def calculate_optimal_font_size(text_length: int, available_space: float, base_s
         return max(4, base_size - 6)
 
 def smart_text_truncation(text: str, max_length: int = 15, preserve_words: bool = True) -> str:
-    """Intelligently truncate text while preserving readability."""
+    """Truncate text while preserving readability when possible.
+
+    Parameters
+    ----------
+    text : str
+        Input title/label text.
+    max_length : int, default 15
+        Maximum resulting character length.
+    preserve_words : bool, default True
+        If True, attempts to retain whole words.
+
+    Returns
+    -------
+    str
+        Possibly shortened text with ellipsis if needed.
+    """
     if len(text) <= max_length:
         return text
     
@@ -248,7 +377,20 @@ def smart_text_truncation(text: str, max_length: int = 15, preserve_words: bool 
     return text[:max_length-3] + "..." if len(text) > max_length else text
 
 def auto_adjust_figure_size(n_items: int, item_type: str = 'bar') -> tuple:
-    """Automatically calculate optimal figure size based on content."""
+    """Compute a reasonable figure size based on content density.
+
+    Parameters
+    ----------
+    n_items : int
+        Number of primary visual elements (e.g., bars, heatmap cells side).
+    item_type : {'bar', 'heatmap', 'network'}, default 'bar'
+        Visualization type that guides the sizing heuristic.
+
+    Returns
+    -------
+    tuple
+        Figure size as ``(width, height)`` in inches.
+    """
     if item_type == 'bar':
         width = max(8, min(16, n_items * 0.4 + 6))
         height = max(6, min(20, n_items * 0.35 + 4))
@@ -264,7 +406,21 @@ def auto_adjust_figure_size(n_items: int, item_type: str = 'bar') -> tuple:
     return (width, height)
 
 def adjust_text_properties(ax, text_elements: list, available_space: tuple):
-    """Dynamically adjust text properties to prevent overlap."""
+    """Reduce label collisions by adjusting font sizes and truncating.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Target axes whose labels are being adjusted.
+    text_elements : list
+        List of text artists to consider.
+    available_space : tuple
+        Available figure space as ``(width, height)`` in inches.
+
+    Returns
+    -------
+    None
+    """
     width, height = available_space
     
     for text_elem in text_elements:
@@ -292,7 +448,28 @@ def create_heatmap(
     vmin: Optional[float] = None,
     vmax: Optional[float] = None
 ) -> Optional[io.BytesIO]:
-    """Create a modern, beautiful heatmap with improved styling and automatic adjustments."""
+    """Create a styled heatmap image buffer.
+
+    Parameters
+    ----------
+    data : pandas.DataFrame
+        Heatmap values; row/column labels are taken from the index/columns.
+    title : str
+        Title shown above the heatmap.
+    color_map : str, default 'RdYlBu_r'
+        Matplotlib colormap name.
+    annot : bool, default True
+        If True, draw text annotations for each cell (capped for large grids).
+    fmt : str, default '.1f'
+        Numeric format string for annotations.
+    vmin, vmax : float, optional
+        Color scale limits.
+
+    Returns
+    -------
+    io.BytesIO or None
+        PNG image buffer on success; None if inputs are invalid.
+    """
     # Validate data
     data = validate_and_clean_data(data, title)
     if data is None:
@@ -358,6 +535,17 @@ def create_heatmap(
                 vmax=vmax,
                 annot_kws={'size': annot_fontsize, 'weight': 'bold'} if should_annotate else None
             )
+
+        # Rasterize large heatmaps to speed up rendering and reduce size
+        total_cells = rows * cols
+        if total_cells >= 2000:
+            try:
+                # QuadMesh is under the first collection
+                im.collections[0].set_rasterized(True)
+                if im.collections[0].colorbar and im.collections[0].colorbar.ax:
+                    im.collections[0].colorbar.ax.set_rasterized(True)
+            except Exception:
+                pass
         
         # Enhanced title styling with automatic font size
         title_fontsize = calculate_optimal_font_size(len(title), figsize[0], 16)
@@ -401,10 +589,11 @@ def create_heatmap(
         # Improved layout with automatic adjustment
         try:
             fig.tight_layout(pad=3.0)
-        except:
+        except Exception:
             fig.subplots_adjust(left=0.15, right=0.92, top=0.88, bottom=0.15)
         
-        return save_plot_to_buffer(fig, dpi=200)
+        # For large heatmaps, skipping tight bbox can speed up saving
+        return save_plot_to_buffer(fig, dpi=200, use_tight_layout=total_cells < 2000)
 
 async def generate_co_occurrence_heatmap(
     guild: discord.Guild,
@@ -412,7 +601,24 @@ async def generate_co_occurrence_heatmap(
     member_period_voice_stats: Dict[int, float],
     relative: bool = False
 ) -> Optional[io.BytesIO]:
-    """Generate co-occurrence heatmap with improved data processing and automatic adjustments."""
+    """Generate a co-occurrence heatmap for guild members.
+
+    Parameters
+    ----------
+    guild : discord.Guild
+        Guild whose members are visualized.
+    co_occurrence_data : dict
+        Mapping ``(member_id_1, member_id_2) -> seconds together``.
+    member_period_voice_stats : dict
+        Mapping ``member_id -> seconds in period`` for relative percentage view.
+    relative : bool, default False
+        If True, normalize each row by the member's total period time (percent).
+
+    Returns
+    -------
+    io.BytesIO or None
+        PNG image buffer on success; None if insufficient data.
+    """
     logging.info(f"Generating {'relative' if relative else 'absolute'} heatmap for guild {guild.id}")
     
     # Validate input
@@ -509,7 +715,22 @@ async def generate_periodic_chart(
     voice_stats_data: Dict[int, Dict[str, float]], 
     period: str
 ) -> Optional[io.BytesIO]:
-    """Generate a bar chart for voice activity with improved styling and automatic adjustments."""
+    """Generate a horizontal bar chart for voice activity by period.
+
+    Parameters
+    ----------
+    guild : discord.Guild
+        Guild whose members are visualized.
+    voice_stats_data : dict
+        Mapping ``member_id -> {period: seconds, ...}``.
+    period : str
+        One of ``'daily'``, ``'weekly'``, ``'monthly'``, ``'yearly'``, ``'total'``.
+
+    Returns
+    -------
+    io.BytesIO or None
+        PNG image buffer on success; None if insufficient data.
+    """
     period_names = {
         'daily': '今日', 'weekly': '本周', 'monthly': '本月',
         'yearly': '今年', 'total': '总计'
@@ -602,11 +823,26 @@ async def generate_periodic_chart(
         # Adjust layout
         fig.tight_layout(pad=2.0)
         
-        return save_plot_to_buffer(fig)
+        return save_plot_to_buffer(fig, use_tight_layout=True)
 
 # Add these helper functions for network graph improvements
 def filter_edges_by_strength(G, edge_weights, keep_percentage=0.3):
-    """Keep only the strongest edges to reduce clutter."""
+    """Keep only the strongest edges to reduce clutter.
+
+    Parameters
+    ----------
+    G : networkx.Graph
+        Graph containing edges.
+    edge_weights : list[float]
+        Edge weights aligned with the order of ``G.edges()`` at construction time.
+    keep_percentage : float, default 0.3
+        Fraction of strongest edges to retain (0-1).
+
+    Returns
+    -------
+    tuple[networkx.Graph, list[float]]
+        Filtered graph and corresponding retained weights.
+    """
     if not edge_weights:
         return G, []
     
@@ -626,7 +862,20 @@ def filter_edges_by_strength(G, edge_weights, keep_percentage=0.3):
     return G_filtered, filtered_weights
 
 def calculate_node_importance(G, weekly_stats=None):
-    """Calculate node importance based on centrality and activity."""
+    """Estimate node importance using centrality and activity.
+
+    Parameters
+    ----------
+    G : networkx.Graph
+        Relationship graph of members.
+    weekly_stats : dict, optional
+        Mapping ``member_id -> seconds this week``.
+
+    Returns
+    -------
+    dict
+        Mapping ``node -> importance score in [0, 1]``.
+    """
     importance = {}
     
     # Calculate centrality measures
@@ -655,7 +904,18 @@ def calculate_node_importance(G, weekly_stats=None):
     return importance
 
 def detect_communities(G):
-    """Detect communities for better layout grouping."""
+    """Detect communities for better layout grouping.
+
+    Parameters
+    ----------
+    G : networkx.Graph
+        Input graph.
+
+    Returns
+    -------
+    tuple[dict, int]
+        Mapping ``node -> community_id`` and number of communities.
+    """
     try:
         import networkx.algorithms.community as nx_comm
         communities = list(nx_comm.greedy_modularity_communities(G))
@@ -672,7 +932,18 @@ def detect_communities(G):
         return {node: 0 for node in G.nodes()}, 1
 
 def create_community_colors(num_communities):
-    """Create distinct colors for communities."""
+    """Create distinct colors for communities.
+
+    Parameters
+    ----------
+    num_communities : int
+        Number of distinct groups.
+
+    Returns
+    -------
+    list[str]
+        Hex RGB color strings sized to ``num_communities``.
+    """
     if num_communities <= 1:
         return ['#1f77b4']  # Single blue color
     
@@ -684,7 +955,22 @@ def create_community_colors(num_communities):
 # 在现有的 filter_edges_by_strength 函数后添加更多辅助函数
 
 def apply_hierarchical_layout(G, community_map, pos_base):
-    """应用分层布局，将同社区节点聚集在一起，但保持足够间距"""
+    """应用分层布局，将同社区节点聚集在一起，但保持足够间距。
+
+    Parameters
+    ----------
+    G : networkx.Graph
+        输入图。
+    community_map : dict
+        ``node -> 社区编号`` 的映射。
+    pos_base : dict
+        初始位置 ``node -> (x, y)``。
+
+    Returns
+    -------
+    dict
+        改善后的节点坐标映射。
+    """
     communities = {}
     for node, comm in community_map.items():
         if comm not in communities:
@@ -727,7 +1013,22 @@ def apply_hierarchical_layout(G, community_map, pos_base):
     return pos_improved
 
 def create_edge_bundling(G, pos, edge_weights):
-    """创建边的捆绑效果，减少视觉混乱"""
+    """创建边的捆绑效果，减少视觉混乱。
+
+    Parameters
+    ----------
+    G : networkx.Graph
+        输入图。
+    pos : dict
+        节点坐标 ``node -> (x, y)``。
+    edge_weights : list[float]
+        边权重列表，与 ``G.edges()`` 顺序一致。
+
+    Returns
+    -------
+    list[dict]
+        边的几何信息列表，用于高级绘制效果。
+    """
     bundled_edges = []
     
     for i, (u, v) in enumerate(G.edges()):
@@ -772,7 +1073,19 @@ def create_edge_bundling(G, pos, edge_weights):
     return bundled_edges
 
 def add_interactive_elements_info(ax, G, node_importance, community_map):
-    """添加交互式信息面板（静态版本的信息展示）"""
+    """添加交互式信息面板（静态版本的信息展示）。
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        目标坐标轴。
+    G : networkx.Graph
+        图对象。
+    node_importance : dict
+        节点重要性映射。
+    community_map : dict
+        节点对应的社区编号。
+    """
     # 创建信息文本框
     info_text = []
     info_text.append(f"Network Statistics:")
@@ -796,7 +1109,20 @@ def add_interactive_elements_info(ax, G, node_importance, community_map):
            fontsize=8, fontfamily='monospace', fontproperties=font_prop)
 
 def apply_node_separation(pos, min_distance=0.1):
-    """Apply minimum distance constraint between nodes to prevent overlap."""
+    """Apply minimum distance constraint between nodes to prevent overlap.
+
+    Parameters
+    ----------
+    pos : dict
+        节点坐标 ``node -> (x, y)``。
+    min_distance : float, default 0.1
+        节点之间的最小目标距离。
+
+    Returns
+    -------
+    dict
+        调整后的节点坐标。
+    """
     import itertools
     
     # Convert to list for easier manipulation
@@ -842,16 +1168,21 @@ async def generate_relationship_network_graph(
     co_occurrence_data: Dict[Tuple[int, int], float],
     weekly_stats: Dict[int, float]
 ) -> Optional[io.BytesIO]:
-    """Generates a network graph visualizing co-occurrence relationships 
-       for top 10 by co-occurrence and top 10 distinct weekly active users.
+    """Generate a relationship network graph for selected guild members.
 
-    Args:
-        guild (discord.Guild): The guild for which to generate the graph.
-        co_occurrence_data (dict): Dictionary containing co-occurrence duration in seconds {(m1_id, m2_id): seconds}.
-        weekly_stats (dict): Dictionary containing weekly voice duration for users {member_id: seconds}.
+    Parameters
+    ----------
+    guild : discord.Guild
+        Guild whose members are visualized.
+    co_occurrence_data : dict
+        ``(member_id_1, member_id_2) -> seconds together``.
+    weekly_stats : dict
+        ``member_id -> seconds active in the past week``.
 
-    Returns:
-        io.BytesIO | None: A BytesIO object containing the PNG image data, or None if error/no data.
+    Returns
+    -------
+    io.BytesIO or None
+        PNG image buffer on success; None if insufficient data.
     """
     if not co_occurrence_data:
         logging.info(f"No co-occurrence data for guild {guild.id} to generate network graph.")
@@ -935,7 +1266,10 @@ async def generate_relationship_network_graph(
         logging.info(f"Selected users for guild {guild.id} have no co-occurrence edges. No graph.")
         return None
 
-    # Calculate node importance and detect communities
+    # Optionally prune weaker edges for clarity/performance
+    G, edges_data = filter_edges_by_strength(G, edges_data, keep_percentage=0.5)
+
+    # Calculate node importance and detect communities on the filtered graph
     node_importance = calculate_node_importance(G, weekly_stats)
     community_map, num_communities = detect_communities(G)
     
@@ -957,9 +1291,17 @@ async def generate_relationship_network_graph(
         # Step 1: Start with a circular layout to ensure initial separation
         initial_pos = nx.circular_layout(G, scale=3.0)  # Increased scale from 2.0 to 3.0
 
-        # Step 2: Apply spring layout with more iterations and higher repulsion
-        k_value = 25.0 / np.sqrt(node_count) if node_count > 0 else 5.0  # Increased from 15.0 to 25.0
-        pos = nx.spring_layout(G, k=k_value, iterations=1000, seed=42, pos=initial_pos, weight='weight')
+        # Step 2: Apply spring layout with dynamic iterations and higher repulsion
+        k_value = 25.0 / np.sqrt(node_count) if node_count > 0 else 5.0
+        iterations = 600 if node_count > 50 else 1000
+        pos = nx.spring_layout(
+            G,
+            k=k_value,
+            iterations=iterations,
+            seed=42,
+            pos=initial_pos,
+            weight='weight',
+        )
 
         # Step 3: Enhance separation by applying scaling
         scaling_factor = 1.6  # Increased from 1.3 to 1.6
@@ -968,21 +1310,27 @@ async def generate_relationship_network_graph(
         # Step 4: Apply node separation logic (using existing function)
         pos = apply_node_separation(pos, min_distance=0.2)
 
-        # Draw edges with varying thickness and transparency
-        edge_weights_normalized = [(w - min_duration) / (max_duration - min_duration) if max_duration > min_duration else 0.5 
-                                  for w in edges_data]
-        
+        # Draw edges efficiently using a LineCollection with per-edge styles
+        edge_weights_normalized = [
+            (w - min_duration) / (max_duration - min_duration) if max_duration > min_duration else 0.5
+            for w in edges_data
+        ]
+
+        segments = []
+        colors = []
+        linewidths = []
         for i, (u, v) in enumerate(G.edges()):
             x1, y1 = pos[u]
             x2, y2 = pos[v]
             weight = edge_weights_normalized[i]
-            
-            # Draw edge with gradient effect
-            ax.plot([x1, x2], [y1, y2], 
-                   color='#666666', 
-                   linewidth=1 + weight * 4, 
-                   alpha=0.3 + weight * 0.5, 
-                   zorder=1)
+            segments.append([(x1, y1), (x2, y2)])
+            alpha = 0.3 + weight * 0.5
+            colors.append((0.4, 0.4, 0.4, alpha))
+            linewidths.append(1.0 + weight * 4.0)
+
+        if segments:
+            lc = LineCollection(segments, colors=colors, linewidths=linewidths, zorder=1)
+            ax.add_collection(lc)
 
         # Prepare enhanced node visual attributes
         node_colors = []
