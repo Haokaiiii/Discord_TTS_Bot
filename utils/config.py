@@ -1,3 +1,9 @@
+"""Configuration utilities for environment variables.
+
+Centralizes reading and validating environment variables for the bot. Public
+helpers use NumPy-style docstrings and perform basic validation, clamping, and
+fallbacks while emitting informative logs.
+"""
 import os
 import logging
 from typing import Set, Optional
@@ -7,7 +13,22 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def get_env_str(key: str, default: Optional[str] = None, required: bool = True) -> Optional[str]:
-    """Get string environment variable with validation."""
+    """Get a string environment variable with validation.
+
+    Parameters
+    ----------
+    key : str
+        Environment variable name.
+    default : str or None, optional
+        Default value if the variable is missing.
+    required : bool, default True
+        If True and the variable is missing, the process exits with code 1.
+
+    Returns
+    -------
+    str or None
+        Resolved value, default, or None when not required.
+    """
     value = os.getenv(key, default)
     if required and not value:
         logging.error(f"Missing required environment variable: {key}")
@@ -15,7 +36,24 @@ def get_env_str(key: str, default: Optional[str] = None, required: bool = True) 
     return value
 
 def get_env_int(key: str, default: int = 0, min_val: Optional[int] = None, max_val: Optional[int] = None) -> int:
-    """Get integer environment variable with validation."""
+    """Get an integer environment variable with validation and clamping.
+
+    Parameters
+    ----------
+    key : str
+        Environment variable name.
+    default : int, default 0
+        Default integer to use when parsing fails.
+    min_val : int or None, optional
+        Minimum allowed value; values below are clamped and a warning is logged.
+    max_val : int or None, optional
+        Maximum allowed value; values above are clamped and a warning is logged.
+
+    Returns
+    -------
+    int
+        Validated and possibly clamped integer value.
+    """
     str_val = os.getenv(key, str(default))
     try:
         int_val = int(str_val)
@@ -31,7 +69,22 @@ def get_env_int(key: str, default: int = 0, min_val: Optional[int] = None, max_v
         return default
 
 def get_env_float(key: str, default: float = 0.0, min_val: Optional[float] = None) -> float:
-    """Get float environment variable with validation."""
+    """Get a float environment variable with validation and optional floor.
+
+    Parameters
+    ----------
+    key : str
+        Environment variable name.
+    default : float, default 0.0
+        Default float to use when parsing fails.
+    min_val : float or None, optional
+        Minimum allowed value; values below are clamped and a warning is logged.
+
+    Returns
+    -------
+    float
+        Validated and possibly clamped float value.
+    """
     str_val = os.getenv(key, str(default))
     try:
         float_val = float(str_val)
@@ -44,7 +97,20 @@ def get_env_float(key: str, default: float = 0.0, min_val: Optional[float] = Non
         return default
 
 def get_env_set_int(key: str, default: str = '') -> Set[int]:
-    """Get a set of integers from comma-separated environment variable."""
+    """Get a set of integers from a comma-separated environment variable.
+
+    Parameters
+    ----------
+    key : str
+        Environment variable name.
+    default : str, default ''
+        Fallback comma-separated value when missing.
+
+    Returns
+    -------
+    set of int
+        Set of parsed integers; invalid items are ignored with a warning.
+    """
     str_val = os.getenv(key, default)
     result = set()
     

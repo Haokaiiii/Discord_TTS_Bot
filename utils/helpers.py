@@ -1,3 +1,8 @@
+"""Helper utilities for Discord bot command handling and safety.
+
+Includes channel permission checks, safe send helpers, and user-friendly
+error handling. All public APIs are documented with NumPy-style docstrings.
+"""
 import logging
 from typing import Optional, Union
 import discord
@@ -8,13 +13,17 @@ from functools import lru_cache
 _command_channel_cache: dict[int, Optional[discord.TextChannel]] = {}
 
 def get_preferred_name(member: Union[discord.Member, discord.User]) -> str:
-    """Returns the nickname if available, otherwise the global name or username.
-    
-    Args:
-        member: Discord member or user object
-        
-    Returns:
-        The preferred display name for the user
+    """Return a member's preferred display name.
+
+    Parameters
+    ----------
+    member : discord.Member or discord.User
+        Discord entity to derive a display name from.
+
+    Returns
+    -------
+    str
+        Nickname if set, otherwise global name or username.
     """
     if isinstance(member, discord.Member) and member.nick:
         return member.nick
@@ -23,10 +32,12 @@ def get_preferred_name(member: Union[discord.Member, discord.User]) -> str:
     return member.name
 
 def check_channel():
-    """Decorator to check if the command is used in the allowed channel.
-    
-    This decorator ensures commands are only executed in designated channels
-    or via DMs if configured.
+    """Restrict a command to the configured channel or DMs.
+
+    Returns
+    -------
+    Callable
+        A command check decorator that validates the channel context.
     """
     async def predicate(ctx: commands.Context) -> bool:
         from utils.config import ALLOWED_COMMAND_CHANNEL_ID
@@ -57,13 +68,17 @@ def check_channel():
     return commands.check(predicate)
 
 def has_required_permissions(channel: discord.VoiceChannel) -> bool:
-    """Check if the bot has connect and speak permissions in the voice channel.
-    
-    Args:
-        channel: The voice channel to check
-        
-    Returns:
-        True if bot has required permissions, False otherwise
+    """Check if the bot has connect and speak permissions in a voice channel.
+
+    Parameters
+    ----------
+    channel : discord.VoiceChannel
+        The voice channel to check permissions for.
+
+    Returns
+    -------
+    bool
+        True when both connect and speak permissions are present.
     """
     if not channel.guild.me:
         logging.error(f"Bot member not found in guild {channel.guild.id}")
@@ -74,14 +89,19 @@ def has_required_permissions(channel: discord.VoiceChannel) -> bool:
 
 @lru_cache(maxsize=128)
 def _get_command_channel(guild: discord.Guild, channel_id: int) -> Optional[discord.TextChannel]:
-    """Get command channel with caching.
-    
-    Args:
-        guild: The guild to search in
-        channel_id: The channel ID to find
-        
-    Returns:
-        The text channel if found and valid, None otherwise
+    """Get the configured command channel with caching.
+
+    Parameters
+    ----------
+    guild : discord.Guild
+        Guild to search in.
+    channel_id : int
+        Channel identifier.
+
+    Returns
+    -------
+    discord.TextChannel or None
+        The channel if found and valid, otherwise None.
     """
     channel = guild.get_channel(channel_id)
     if channel and isinstance(channel, discord.TextChannel):
@@ -90,12 +110,16 @@ def _get_command_channel(guild: discord.Guild, channel_id: int) -> Optional[disc
 
 def _find_fallback_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
     """Find a fallback text channel the bot can write to.
-    
-    Args:
-        guild: The guild to search in
-        
-    Returns:
-        First available text channel with send permissions, or None
+
+    Parameters
+    ----------
+    guild : discord.Guild
+        Guild to search in.
+
+    Returns
+    -------
+    discord.TextChannel or None
+        First available text channel with send permissions, or None.
     """
     bot_member = guild.me
     if not bot_member:
@@ -124,17 +148,25 @@ async def send_to_command_channel(
     file: Optional[discord.File] = None,
     embed: Optional[discord.Embed] = None
 ) -> bool:
-    """Sends a message, file, or embed to the designated command channel for a guild.
-    
-    Args:
-        bot: The bot instance
-        guild_id: The guild ID to send to
-        content: Optional text content
-        file: Optional file to send
-        embed: Optional embed to send
-        
-    Returns:
-        True if message was sent successfully, False otherwise
+    """Send content to the configured command channel for a guild.
+
+    Parameters
+    ----------
+    bot : commands.Bot
+        The bot instance.
+    guild_id : int
+        Guild ID to send to.
+    content : str or None, optional
+        Text content to send.
+    file : discord.File or None, optional
+        File attachment to send.
+    embed : discord.Embed or None, optional
+        Rich embed to send.
+
+    Returns
+    -------
+    bool
+        True if the message was sent successfully, False otherwise.
     """
     from utils.config import ALLOWED_COMMAND_CHANNEL_ID
 
@@ -200,9 +232,11 @@ async def send_to_command_channel(
 
 def clear_channel_cache(guild_id: Optional[int] = None):
     """Clear the command channel cache.
-    
-    Args:
-        guild_id: If provided, only clear cache for this guild. Otherwise clear all.
+
+    Parameters
+    ----------
+    guild_id : int or None, optional
+        If provided, only clear cache for this guild. Otherwise clear all.
     """
     if guild_id:
         _command_channel_cache.pop(guild_id, None)
@@ -216,11 +250,14 @@ class BotException(Exception):
     pass
 
 async def handle_command_error(ctx: commands.Context, error: Exception):
-    """Global error handler for commands with improved error messages.
-    
-    Args:
-        ctx: The command context
-        error: The exception that was raised
+    """Global error handler for commands with improved messages.
+
+    Parameters
+    ----------
+    ctx : commands.Context
+        The command context.
+    error : Exception
+        The exception that was raised.
     """
     # Log the error first
     if ctx.command:
@@ -273,15 +310,22 @@ async def safe_send(
     **kwargs
 ) -> Optional[discord.Message]:
     """Safely send a message with error handling.
-    
-    Args:
-        ctx: The command context
-        content: The message content
-        delete_after: Optional seconds after which to delete the message
-        **kwargs: Additional arguments to pass to send()
-        
-    Returns:
-        The sent message if successful, None otherwise
+
+    Parameters
+    ----------
+    ctx : commands.Context
+        The command context.
+    content : str
+        The message content.
+    delete_after : float or None, optional
+        Seconds after which to delete the message.
+    **kwargs
+        Additional arguments to pass to ``ctx.send``.
+
+    Returns
+    -------
+    discord.Message or None
+        The sent message if successful, None otherwise.
     """
     try:
         return await ctx.send(content, delete_after=delete_after, **kwargs)

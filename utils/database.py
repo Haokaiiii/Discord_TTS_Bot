@@ -1,3 +1,8 @@
+"""Database utilities for persisting and backing up bot statistics.
+
+Provides a high-level ``DatabaseManager`` that coordinates MongoDB access,
+local JSON backups with rotation, and resilient async saving with retries.
+"""
 import logging
 import json
 import os
@@ -13,8 +18,21 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from utils.config import MONGODB_URI, BACKUP_DIR, MAX_BACKUP_FILES
 
 class DatabaseManager:
+    """Manage MongoDB connections, retries, and local backups.
+
+    Establishes both synchronous and asynchronous clients, and exposes helpers
+    to save and load voice statistics and co-occurrence statistics. Also
+    handles local JSON backups with rotation for resilience.
+    """
+
     def __init__(self):
-        """Initialize database manager with connection pooling and async support."""
+        """Initialize clients, DB handles, and synchronization primitives.
+
+        Raises
+        ------
+        pymongo.errors.PyMongoError
+            If the initial connection or ping fails.
+        """
         try:
             # Sync client for initial loading
             self.sync_client = MongoClient(
@@ -52,7 +70,13 @@ class DatabaseManager:
             raise
 
     def _rotate_backups(self, pattern: str) -> None:
-        """Rotate backup files to maintain MAX_BACKUP_FILES limit."""
+        """Rotate backup files to maintain ``MAX_BACKUP_FILES`` limit.
+
+        Parameters
+        ----------
+        pattern : str
+            Glob pattern of files to consider for rotation.
+        """
         backup_files = sorted(glob.glob(os.path.join(BACKUP_DIR, pattern)))
         
         if len(backup_files) > MAX_BACKUP_FILES:
@@ -65,7 +89,20 @@ class DatabaseManager:
                     logging.error(f"Failed to remove old backup {file_path}: {e}")
 
     def _save_local_backup(self, data: Dict[Any, Any], filename: str) -> bool:
-        """Saves data to a local backup file with rotation."""
+        """Save data to a local backup file with rotation.
+
+        Parameters
+        ----------
+        data : dict
+            Serializable data structure to persist as JSON.
+        filename : str
+            Target filename placed inside ``BACKUP_DIR``.
+
+        Returns
+        -------
+        bool
+            True when backup was written successfully.
+        """
         backup_path = os.path.join(BACKUP_DIR, filename)
         
         try:
@@ -95,7 +132,18 @@ class DatabaseManager:
             return False
 
     def _load_local_backup(self, filename: str) -> Optional[Dict[Any, Any]]:
-        """Loads data from a local backup file."""
+        """Load data from a local backup file.
+
+        Parameters
+        ----------
+        filename : str
+            Backup filename to read from ``BACKUP_DIR``.
+
+        Returns
+        -------
+        dict or None
+            Parsed data if the backup exists and is valid JSON, otherwise None.
+        """
         backup_path = os.path.join(BACKUP_DIR, filename)
         
         if not os.path.exists(backup_path):
@@ -111,7 +159,18 @@ class DatabaseManager:
             return None
 
     def _find_latest_backup(self, prefix: str) -> Optional[str]:
-        """Find the most recent backup file with given prefix."""
+        """Find the most recent backup file with a given prefix.
+
+        Parameters
+        ----------
+        prefix : str
+            Filename prefix used to locate backup files.
+
+        Returns
+        -------
+        str or None
+            Filename of the latest backup, or None if none exist.
+        """
         pattern = os.path.join(BACKUP_DIR, f"{prefix}_*.json")
         backup_files = sorted(glob.glob(pattern))
         
@@ -127,7 +186,18 @@ class DatabaseManager:
         on_backoff=lambda details: logging.warning(f"MongoDB retry attempt {details['tries']} after {details['wait']:.1f}s")
     )
     async def save_voice_stats(self, voice_stats_data: Dict[int, Dict[int, Dict[str, float]]]) -> bool:
-        """Save voice statistics with retry logic and backup."""
+        """Save voice statistics with retry logic and backup.
+
+        Parameters
+        ----------
+        voice_stats_data : dict
+            Mapping ``guild_id -> member_id -> {period: seconds, ...}``.
+
+        Returns
+        -------
+        bool
+            True if at least one guild's stats were saved successfully.
+        """
         async with self.save_lock:
             try:
                 # Create backup
@@ -193,7 +263,18 @@ class DatabaseManager:
         on_backoff=lambda details: logging.warning(f"MongoDB retry attempt {details['tries']} after {details['wait']:.1f}s")
     )
     async def save_co_occurrence_stats(self, co_occurrence_data: Dict[int, Dict[Tuple[int, int], float]]) -> bool:
-        """Save co-occurrence statistics with retry logic and backup."""
+        """Save co-occurrence statistics with retry logic and backup.
+
+        Parameters
+        ----------
+        co_occurrence_data : dict
+            Mapping ``guild_id -> {(m1, m2): seconds, ...}``.
+
+        Returns
+        -------
+        bool
+            True if at least one guild's stats were saved successfully.
+        """
         async with self.save_lock:
             try:
                 # Create backup
@@ -252,7 +333,13 @@ class DatabaseManager:
                 return False
 
     def load_voice_stats(self) -> Dict[int, Dict[int, Dict[str, float]]]:
-        """Load voice statistics from backup or MongoDB."""
+        """Load voice statistics from the latest backup or MongoDB.
+
+        Returns
+        -------
+        dict
+            Mapping ``guild_id -> member_id -> {period: seconds, ...}``.
+        """
         voice_stats: Dict[int, Dict[int, Dict[str, float]]] = {}
         
         try:
@@ -303,7 +390,13 @@ class DatabaseManager:
         return voice_stats
 
     def load_co_occurrence_stats(self) -> Dict[int, Dict[Tuple[int, int], float]]:
-        """Load co-occurrence statistics from backup or MongoDB."""
+        """Load co-occurrence statistics from the latest backup or MongoDB.
+
+        Returns
+        -------
+        dict
+            Mapping ``guild_id -> {(m1, m2): seconds, ...}``.
+        """
         co_occurrence_stats: Dict[int, Dict[Tuple[int, int], float]] = {}
         
         try:
@@ -341,7 +434,22 @@ class DatabaseManager:
         output: Dict[int, Dict[Tuple[int, int], float]],
         source: str
     ) -> bool:
-        """Parse co-occurrence data from backup or MongoDB format."""
+        """Parse co-occurrence data from serialized forms.
+
+        Parameters
+        ----------
+        data : dict
+            Serialized mapping ``guild_id(str) -> {"m1,m2": seconds, ...}``.
+        output : dict
+            Output mapping populated as ``guild_id(int) -> {(m1, m2): seconds, ...}``.
+        source : str
+            Human-friendly source label for logging (e.g., "backup", "MongoDB").
+
+        Returns
+        -------
+        bool
+            True if at least one guild's data was parsed successfully.
+        """
         success = False
         
         for guild_id_str, pairs_dict in data.items():
@@ -387,7 +495,12 @@ class DatabaseManager:
         return success
 
     def close(self):
-        """Close database connections."""
+        """Close synchronous MongoDB connections.
+
+        Returns
+        -------
+        None
+        """
         try:
             self.sync_client.close()
             logging.info("Closed sync MongoDB connection")
@@ -395,7 +508,12 @@ class DatabaseManager:
             logging.error(f"Error closing sync MongoDB connection: {e}")
 
     async def aclose(self):
-        """Close async database connections."""
+        """Close asynchronous MongoDB connections.
+
+        Returns
+        -------
+        None
+        """
         try:
             self.async_client.close()
             logging.info("Closed async MongoDB connection")
